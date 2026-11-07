@@ -1,0 +1,1569 @@
+#!/usr/bin/env python3
+"""
+steamframe-setup: System configuration tool for Valve Steam Frame / VRLink on CachyOS / Arch Linux.
+
+Automatically applies, checks, and cleanly reverts all necessary system tweaks
+for the Valve Steam Frame Wireless Dongle (rtw89 driver) and VRLink/SteamVR.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+import datetime
+import hashlib
+import json
+import logging
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+# ==============================================================================
+# Constants & Configuration
+# ==============================================================================
+
+VERSION = "1.0.0"
+TOOL_NAME = "steamframe-setup"
+DEFAULT_COUNTRY = "DE"
+FIREWALL_COMMENT = "steamframe-setup"
+
+# VRLink & Steam Remote Play network ports
+# 27031, 27036, 27037 are standard Valve streaming ports.
+# 10400/10401 are reported VRLink streaming channels from user research.
+# Kept here as top-level constants for easy modification.
+VRLINK_PORTS = [
+    {"port": 27031, "proto": "udp", "desc": "Remote-Play-Handshake"},
+    {"port": 27036, "proto": "udp", "desc": "Discovery"},
+    {"port": 27036, "proto": "tcp", "desc": "Sitzungssteuerung"},
+    {"port": 27037, "proto": "tcp", "desc": "Streaming-Kontrollkanal"},
+    {"port": 10400, "proto": "udp", "desc": "VRLink-Videostrom (Kandidat)"},
+    {"port": 10401, "proto": "udp", "desc": "VRLink-Rückkanal (Kandidat)"},
+]
+
+# Relative paths (relative to root)
+MANIFEST_REL_PATH = Path("var/lib/steamframe-setup/manifest.json")
+BACKUP_REL_DIR = Path("var/lib/steamframe-setup/backups")
+LOG_REL_PATH = Path("var/log/steamframe-setup.log")
+
+REGDOM_CONF_REL = Path("etc/conf.d/wireless-regdom")
+MODPROBE_CONF_REL = Path("etc/modprobe.d/steamframe-regdom.conf")
+SYSTEMD_UNIT_REL = Path("etc/systemd/system/steamframe-regdom.service")
+NM_CONF_REL = Path("etc/NetworkManager/conf.d/99-steamframe-powersave.conf")
+NM_DISPATCHER_REL = Path("etc/NetworkManager/dispatcher.d/99-steamframe.sh")
+
+# ANSI Color Codes
+class Colors:
+    HEADER = "\033[95m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+    @classmethod
+    def enabled(cls) -> bool:
+        if os.environ.get("NO_COLOR"):
+            return False
+        return sys.stdout.isatty()
+
+    @classmethod
+    def colorize(cls, text: str, color: str) -> str:
+        if not cls.enabled():
+            return text
+        return f"{color}{text}{cls.RESET}"
+
+# ==============================================================================
+# Data Structures
+# ==============================================================================
+
+@dataclass
+class DongleInfo:
+    iface: str
+    driver: str
+    driver_path: str
+    bus: str  # usb, pci, virtual, etc.
+    mac: str = ""
+    is_rtw89: bool = False
+
+@dataclass
+class CommandResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    cmd: List[str]
+
+    @property
+    def success(self) -> bool:
+        return self.returncode == 0
+
+@dataclass
+class CheckItem:
+    category: str
+    name: str
+    status: str  # OK, WARN, UNAPPLIED, DIVERGENT
+    message: str
+    details: str = ""
+
+# ==============================================================================
+# Command Execution & System Abstraction
+# ==============================================================================
+
+class SystemExecutor:
+    """Handles execution of external commands and file operations with logging."""
+
+    def __init__(self, dry_run: bool = False, root: Path = Path("/")):
+        self.dry_run = dry_run
+        self.root = root.resolve()
+        self.logger = logging.getLogger(TOOL_NAME)
+
+    def resolve_path(self, rel_or_abs: Path | str) -> Path:
+        """Resolves a target path relative to self.root."""
+        p = Path(rel_or_abs)
+        if p.is_absolute():
+            # Strip leading '/' to join cleanly with root
+            p = Path(*p.parts[1:])
+        return self.root / p
+
+    def run_cmd(
+        self,
+        cmd: List[str],
+        check: bool = False,
+        capture_output: bool = True,
+        simulate_in_dry_run: bool = False,
+        dry_run_output: str = "",
+    ) -> CommandResult:
+        """Runs a subprocess command with logging and error handling."""
+        cmd_str = " ".join(cmd)
+        self.logger.debug(f"Command execution: {cmd_str} (dry_run={self.dry_run})")
+
+        if self.dry_run and not simulate_in_dry_run:
+            self.logger.info(f"[DRY-RUN] Would execute: {cmd_str}")
+            return CommandResult(
+                returncode=0,
+                stdout=dry_run_output,
+                stderr="",
+                cmd=cmd,
+            )
+
+        try:
+            res = subprocess.run(
+                cmd,
+                text=True,
+                capture_output=capture_output,
+                check=False,
+            )
+            self.logger.debug(
+                f"Exit code {res.returncode} for: {cmd_str}\n"
+                f"Stdout: {res.stdout.strip()}\nStderr: {res.stderr.strip()}"
+            )
+            if check and res.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    res.returncode, cmd, output=res.stdout, stderr=res.stderr
+                )
+            return CommandResult(
+                returncode=res.returncode,
+                stdout=res.stdout if res.stdout else "",
+                stderr=res.stderr if res.stderr else "",
+                cmd=cmd,
+            )
+        except FileNotFoundError:
+            self.logger.error(f"Binary not found: {cmd[0]}")
+            return CommandResult(
+                returncode=127,
+                stdout="",
+                stderr=f"Binary not found: {cmd[0]}",
+                cmd=cmd,
+            )
+        except Exception as e:
+            self.logger.error(f"Execution error for {cmd_str}: {e}")
+            return CommandResult(
+                returncode=1,
+                stdout="",
+                stderr=str(e),
+                cmd=cmd,
+            )
+
+    def write_file(self, target_path: Path, content: str, mode: int = 0o644) -> None:
+        """Writes content to target_path, respecting dry_run."""
+        self.logger.debug(f"Writing file {target_path} (dry_run={self.dry_run})")
+        if self.dry_run:
+            self.logger.info(f"[DRY-RUN] Would write to {target_path}")
+            return
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(content, encoding="utf-8")
+        try:
+            target_path.chmod(mode)
+        except Exception as e:
+            self.logger.warning(f"Could not chmod {mode:o} on {target_path}: {e}")
+
+    def remove_file(self, target_path: Path) -> bool:
+        """Removes a file if it exists, respecting dry_run."""
+        if not target_path.exists():
+            return False
+        if self.dry_run:
+            self.logger.info(f"[DRY-RUN] Would remove {target_path}")
+            return True
+        try:
+            target_path.unlink()
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to delete {target_path}: {e}")
+            return False
+
+# ==============================================================================
+# User & Home Resolution
+# ==============================================================================
+
+def get_target_user(executor: SystemExecutor) -> Tuple[str, Path, int, int]:
+    """
+    Identifies the invoking non-root user (via SUDO_USER or current login)
+    and returns (username, user_home, uid, gid).
+    Respects executor.root for fake-root test environments.
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    username = sudo_user or os.environ.get("USER") or os.getlogin()
+
+    try:
+        pw = pwd.getpwnam(username)
+        real_home = Path(pw.pw_dir)
+        uid = pw.pw_uid
+        gid = pw.pw_gid
+    except Exception:
+        real_home = Path.home()
+        uid = os.getuid()
+        gid = os.getgid()
+
+    if executor.root != Path("/"):
+        # Sandbox / fake-root environment: resolve inside fake-root
+        user_home = executor.resolve_path(real_home)
+    else:
+        user_home = real_home
+
+    return username, user_home, uid, gid
+
+# ==============================================================================
+# Hardware & Interface Detection
+# ==============================================================================
+
+class DongleDetector:
+    """Scans and detects the Steam Frame wireless dongle (rtw89 driver)."""
+
+    def __init__(self, executor: SystemExecutor):
+        self.executor = executor
+
+    def scan_interfaces(self) -> List[DongleInfo]:
+        """Scans sysfs for network interfaces and driver associations."""
+        net_dir = self.executor.resolve_path("sys/class/net")
+        results: List[DongleInfo] = []
+
+        if not net_dir.exists():
+            return results
+
+        for iface_entry in sorted(net_dir.iterdir()):
+            iface_name = iface_entry.name
+            # Skip loopback and obvious virtual adapters
+            if iface_name == "lo" or iface_name.startswith(("tailscale", "tun", "tap", "docker", "veth", "br")):
+                continue
+
+            driver_symlink = iface_entry / "device" / "driver"
+            driver_name = ""
+            driver_path = ""
+            bus = "unknown"
+
+            if driver_symlink.exists():
+                try:
+                    driver_target = driver_symlink.resolve()
+                    driver_name = driver_target.name
+                    driver_path = str(driver_target)
+                except Exception:
+                    pass
+
+            # Detect bus type
+            device_dir = iface_entry / "device"
+            if device_dir.exists():
+                try:
+                    subsys = (device_dir / "subsystem").resolve().name
+                    if subsys == "pci":
+                        bus = "pci"
+                    elif subsys == "usb" or "usb" in str(device_dir.resolve()):
+                        bus = "usb"
+                except Exception:
+                    pass
+
+            # Read MAC address if present
+            mac = ""
+            addr_file = iface_entry / "address"
+            if addr_file.exists():
+                try:
+                    mac = addr_file.read_text(encoding="utf-8").strip()
+                except Exception:
+                    pass
+
+            is_rtw89 = "rtw89" in driver_name.lower()
+
+            results.append(
+                DongleInfo(
+                    iface=iface_name,
+                    driver=driver_name,
+                    driver_path=driver_path,
+                    bus=bus,
+                    mac=mac,
+                    is_rtw89=is_rtw89,
+                )
+            )
+
+        return results
+
+    def find_dongle(self, requested_iface: Optional[str] = None, interactive: bool = True) -> Optional[DongleInfo]:
+        """
+        Locates the appropriate dongle interface.
+        Protects the internal WLAN card from accidental modification.
+        """
+        all_ifaces = self.scan_interfaces()
+
+        if requested_iface:
+            matched = [i for i in all_ifaces if i.iface == requested_iface]
+            if not matched:
+                # Interface requested by user but doesn't exist in sysfs
+                return DongleInfo(
+                    iface=requested_iface,
+                    driver="manual",
+                    driver_path="",
+                    bus="unknown",
+                    is_rtw89=True,
+                )
+            selected = matched[0]
+            if not selected.is_rtw89:
+                print(
+                    Colors.colorize(
+                        f"WARNUNG: Die angegebene Schnittstelle '{requested_iface}' nutzt den Treiber '{selected.driver}' (nicht rtw89)!",
+                        Colors.YELLOW,
+                    )
+                )
+            return selected
+
+        # Auto-detect candidates using rtw89 driver
+        candidates = [i for i in all_ifaces if i.is_rtw89]
+
+        if not candidates:
+            return None
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Multiple candidates found: prompt user
+        print(Colors.colorize("Mehrere Dongle-Kandidaten (rtw89) gefunden:", Colors.CYAN))
+        for idx, cand in enumerate(candidates, 1):
+            print(f"  {idx}) {cand.iface} (Treiber: {cand.driver}, Bus: {cand.bus}, MAC: {cand.mac})")
+
+        if not interactive:
+            print(Colors.colorize("Fehler: Mehrere rtw89-Schnittstellen gefunden. Bitte Schnittstelle mit --iface angeben.", Colors.RED))
+            sys.exit(1)
+
+        while True:
+            try:
+                choice = input(f"Bitte wählen [1-{len(candidates)}]: ").strip()
+                if choice.isdigit() and 1 <= int(choice) <= len(candidates):
+                    return candidates[int(choice) - 1]
+            except (KeyboardInterrupt, EOFError):
+                sys.exit(1)
+
+# ==============================================================================
+# Manifest Management (Backup & State Tracking)
+# ==============================================================================
+
+class ManifestManager:
+    """Manages /var/lib/steamframe-setup/manifest.json and backup restorations."""
+
+    def __init__(self, executor: SystemExecutor):
+        self.executor = executor
+        self.manifest_path = executor.resolve_path(MANIFEST_REL_PATH)
+        self.backup_dir = executor.resolve_path(BACKUP_REL_DIR)
+
+    def load_manifest(self) -> Dict[str, Any]:
+        """Loads existing manifest, or returns an empty structure."""
+        if not self.manifest_path.exists():
+            return {}
+        try:
+            data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+            return data
+        except Exception as e:
+            self.executor.logger.error(f"Failed to read manifest {self.manifest_path}: {e}")
+            return {}
+
+    def save_manifest(self, manifest_data: Dict[str, Any]) -> None:
+        """Saves manifest_data to disk."""
+        if self.executor.dry_run:
+            self.executor.logger.info(f"[DRY-RUN] Would save manifest to {self.manifest_path}")
+            return
+
+        self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        content = json.dumps(manifest_data, indent=2, ensure_ascii=False)
+        self.manifest_path.write_text(content, encoding="utf-8")
+        try:
+            self.manifest_path.chmod(0o600)
+        except Exception:
+            pass
+
+    def backup_file(self, target_path: Path, manifest_data: Dict[str, Any]) -> None:
+        """
+        Backs up target_path before modification if not already backed up.
+        Stores SHA256 and backup copy.
+        """
+        key = str(target_path)
+        modified_files = manifest_data.setdefault("modified_files", {})
+        if key in modified_files:
+            # File already has a prior backup in this manifest session
+            return
+
+        if not target_path.exists():
+            modified_files[key] = {
+                "existed_before": False,
+                "backup_path": None,
+                "sha256": None,
+            }
+            return
+
+        # Read content and compute hash
+        content = target_path.read_bytes()
+        sha = hashlib.sha256(content).hexdigest()
+
+        # Destination in backup directory
+        if not self.executor.dry_run:
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_file_name = f"{target_path.name}.{sha[:8]}.bak"
+            backup_file_path = self.backup_dir / backup_file_name
+            backup_file_path.write_bytes(content)
+            try:
+                backup_file_path.chmod(0o600)
+            except Exception:
+                pass
+            backup_rel = str(backup_file_path)
+        else:
+            backup_rel = f"[DRY-RUN-BACKUP-OF-{target_path.name}]"
+
+        modified_files[key] = {
+            "existed_before": True,
+            "backup_path": backup_rel,
+            "sha256": sha,
+        }
+
+    def record_created_file(self, target_path: Path, manifest_data: Dict[str, Any]) -> None:
+        """Records a file created by this tool in the manifest."""
+        path_str = str(target_path)
+        created = manifest_data.setdefault("created_files", [])
+        if path_str not in created:
+            created.append(path_str)
+
+    def record_ufw_rule(self, rule_dict: Dict[str, Any], manifest_data: Dict[str, Any]) -> None:
+        """Records a UFW rule applied by this tool."""
+        rules = manifest_data.setdefault("ufw_rules", [])
+        # Check duplicates
+        for r in rules:
+            if (
+                r.get("port") == rule_dict.get("port")
+                and r.get("proto") == rule_dict.get("proto")
+                and r.get("scope") == rule_dict.get("scope")
+                and r.get("iface") == rule_dict.get("iface")
+            ):
+                return
+        rules.append(rule_dict)
+
+    def record_installed_package(self, pkg_name: str, manifest_data: Dict[str, Any]) -> None:
+        """Records a package installed by this tool."""
+        pkgs = manifest_data.setdefault("installed_packages", [])
+        if pkg_name not in pkgs:
+            pkgs.append(pkg_name)
+
+    def remove_manifest_and_backups(self) -> None:
+        """Deletes manifest file and backup directory cleanly."""
+        if self.executor.dry_run:
+            self.executor.logger.info("[DRY-RUN] Would remove manifest file and backup directory")
+            return
+        if self.manifest_path.exists():
+            try:
+                self.manifest_path.unlink()
+            except Exception as e:
+                self.executor.logger.error(f"Failed to delete manifest: {e}")
+
+        if self.backup_dir.exists():
+            try:
+                shutil.rmtree(self.backup_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        # Also remove parent directory if empty
+        try:
+            parent = self.manifest_path.parent
+            if parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()
+        except Exception:
+            pass
+
+# ==============================================================================
+# Firewall Manager
+# ==============================================================================
+
+class FirewallManager:
+    """Detects active firewall and configures UFW rules safely."""
+
+    def __init__(self, executor: SystemExecutor):
+        self.executor = executor
+
+    def detect_active_firewall(self) -> str:
+        """
+        Determines which firewall is active: 'ufw', 'firewalld', 'nftables', or 'none'.
+        """
+        # Check UFW
+        res_ufw = self.executor.run_cmd(["ufw", "status"], simulate_in_dry_run=True)
+        if res_ufw.returncode == 0 and "Status: active" in res_ufw.stdout:
+            return "ufw"
+
+        # Check firewalld
+        res_fwd = self.executor.run_cmd(["firewall-cmd", "--state"], simulate_in_dry_run=True)
+        if res_fwd.returncode == 0 and "running" in res_fwd.stdout:
+            return "firewalld"
+
+        # Check systemctl for active services
+        res_ufw_svc = self.executor.run_cmd(["systemctl", "is-active", "ufw"], simulate_in_dry_run=True)
+        if res_ufw_svc.returncode == 0 and res_ufw_svc.stdout.strip() == "active":
+            return "ufw"
+
+        res_nft_svc = self.executor.run_cmd(["systemctl", "is-active", "nftables"], simulate_in_dry_run=True)
+        if res_nft_svc.returncode == 0 and res_nft_svc.stdout.strip() == "active":
+            return "nftables"
+
+        return "none"
+
+    def get_existing_ufw_rules(self) -> List[str]:
+        """Gets existing active UFW rules."""
+        res = self.executor.run_cmd(["ufw", "status", "verbose"], simulate_in_dry_run=True)
+        if res.returncode != 0:
+            return []
+        return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+
+    def is_rule_present(self, port: int, proto: str, scope: str, iface: Optional[str], existing_lines: List[str]) -> bool:
+        """Checks if a rule for this port/proto already exists in UFW status output."""
+        proto_lower = proto.lower()
+        port_proto_str = f"{port}/{proto_lower}"
+        for line in existing_lines:
+            line_clean = line.lower()
+            if port_proto_str in line_clean and "allow" in line_clean:
+                if scope == "iface" and iface:
+                    if iface.lower() in line_clean:
+                        return True
+                else:
+                    return True
+        return False
+
+    def apply_rules(
+        self,
+        scope: str,
+        iface: Optional[str],
+        manifest_mgr: ManifestManager,
+        manifest_data: Dict[str, Any],
+    ) -> List[str]:
+        """Applies missing UFW rules for VRLink ports."""
+        applied_messages: List[str] = []
+        fw_type = self.detect_active_firewall()
+
+        if fw_type != "ufw":
+            msg = (
+                f"Firewall-Status: '{fw_type}' erkannt. UFW ist nicht aktiv.\n"
+                "Firewall-Regeln werden nur bei aktiver UFW angewendet. Keine Änderungen vorgenommen."
+            )
+            print(Colors.colorize(msg, Colors.YELLOW))
+            return applied_messages
+
+        if scope == "iface" and not iface:
+            msg = (
+                "UFW-Scope ist auf 'iface' gesetzt, aber es wurde kein Dongle-Interface gefunden.\n"
+                "Überspringe Firewall-Freigaben (oder nutzen Sie --ufw-scope all)."
+            )
+            print(Colors.colorize(msg, Colors.YELLOW))
+            return applied_messages
+
+        existing_lines = self.get_existing_ufw_rules()
+
+        for p_info in VRLINK_PORTS:
+            port = p_info["port"]
+            proto = p_info["proto"]
+            desc = p_info["desc"]
+
+            if self.is_rule_present(port, proto, scope, iface, existing_lines):
+                self.executor.logger.info(f"UFW rule for {port}/{proto} already present.")
+                continue
+
+            # Build command
+            if scope == "iface" and iface:
+                cmd = [
+                    "ufw", "allow", "in", "on", iface,
+                    "to", "any", "port", str(port), "proto", proto,
+                    "comment", FIREWALL_COMMENT,
+                ]
+                del_cmd = [
+                    "ufw", "delete", "allow", "in", "on", iface,
+                    "to", "any", "port", str(port), "proto", proto,
+                ]
+            else:
+                cmd = [
+                    "ufw", "allow", f"{port}/{proto}",
+                    "comment", FIREWALL_COMMENT,
+                ]
+                del_cmd = [
+                    "ufw", "delete", "allow", f"{port}/{proto}",
+                ]
+
+            res = self.executor.run_cmd(cmd)
+            if res.success:
+                rule_record = {
+                    "port": port,
+                    "proto": proto,
+                    "scope": scope,
+                    "iface": iface if scope == "iface" else None,
+                    "delete_cmd": del_cmd,
+                }
+                manifest_mgr.record_ufw_rule(rule_record, manifest_data)
+                applied_messages.append(f"UFW: {port}/{proto} ({desc}) freigegeben [Scope: {scope}]")
+            else:
+                applied_messages.append(f"Fehler bei UFW {port}/{proto}: {res.stderr}")
+
+        return applied_messages
+
+    def revert_rules(self, manifest_data: Dict[str, Any]) -> List[str]:
+        """Reverts all UFW rules recorded in manifest."""
+        reverted: List[str] = []
+        rules = manifest_data.get("ufw_rules", [])
+
+        if not rules:
+            return reverted
+
+        fw_type = self.detect_active_firewall()
+        if fw_type != "ufw" and not self.executor.dry_run:
+            reverted.append("UFW ist inaktiv; gespeicherte UFW-Regeln werden dennoch gelöscht.")
+
+        for r in rules:
+            del_cmd = r.get("delete_cmd")
+            port = r.get("port")
+            proto = r.get("proto")
+            if not del_cmd:
+                # Fallback delete syntax
+                if r.get("scope") == "iface" and r.get("iface"):
+                    del_cmd = ["ufw", "delete", "allow", "in", "on", r["iface"], "to", "any", "port", str(port), "proto", proto]
+                else:
+                    del_cmd = ["ufw", "delete", "allow", f"{port}/{proto}"]
+
+            res = self.executor.run_cmd(del_cmd)
+            if res.success or "could not find" in res.stderr.lower():
+                reverted.append(f"UFW-Regel entfernt: {port}/{proto}")
+            else:
+                reverted.append(f"UFW-Regel {port}/{proto} konnte nicht entfernt werden: {res.stderr.strip()}")
+
+        # Reload UFW to apply clean state
+        self.executor.run_cmd(["ufw", "reload"])
+        return reverted
+
+# ==============================================================================
+# Regulatory Domain Manager
+# ==============================================================================
+
+class RegdomManager:
+    """Configures wireless regulatory domain (DE / 6 GHz) persistently and safely."""
+
+    def __init__(self, executor: SystemExecutor):
+        self.executor = executor
+
+    def check_and_install_package(
+        self,
+        auto_yes: bool,
+        interactive: bool,
+        manifest_mgr: ManifestManager,
+        manifest_data: Dict[str, Any],
+    ) -> bool:
+        """Verifies wireless-regdb is installed; prompts to install via pacman if missing."""
+        res = self.executor.run_cmd(["pacman", "-Q", "wireless-regdb"], simulate_in_dry_run=True)
+        if res.returncode == 0:
+            return True
+
+        print(Colors.colorize("Paket 'wireless-regdb' fehlt. Es ist zwingend erforderlich für 6-GHz-Support.", Colors.YELLOW))
+
+        if not auto_yes:
+            if not interactive:
+                print(Colors.colorize("Installation abgebrochen: Nicht-interaktiver Modus ohne --yes.", Colors.RED))
+                return False
+            try:
+                ans = input("Möchten Sie 'wireless-regdb' jetzt via pacman installieren? [j/N]: ").strip().lower()
+                if ans not in ("j", "ja", "y", "yes"):
+                    print(Colors.colorize("Installation übersprungen.", Colors.YELLOW))
+                    return False
+            except (KeyboardInterrupt, EOFError):
+                sys.exit(1)
+
+        res_install = self.executor.run_cmd(["pacman", "-S", "--needed", "--noconfirm", "wireless-regdb"])
+        if res_install.success:
+            manifest_mgr.record_installed_package("wireless-regdb", manifest_data)
+            print(Colors.colorize("Paket 'wireless-regdb' erfolgreich installiert.", Colors.GREEN))
+            return True
+        else:
+            print(Colors.colorize(f"Fehler bei Installation von 'wireless-regdb': {res_install.stderr}", Colors.RED))
+            return False
+
+    def get_current_regdom(self) -> Tuple[str, str]:
+        """
+        Parses `iw reg get` to return (global_country, full_output).
+        """
+        res = self.executor.run_cmd(["iw", "reg", "get"], simulate_in_dry_run=True)
+        if res.returncode != 0:
+            return "UNKNOWN", res.stderr
+
+        output = res.stdout
+        country = "UNKNOWN"
+        match = re.search(r"country\s+([A-Z0-9]{2}):", output)
+        if match:
+            country = match.group(1)
+        return country, output
+
+    def check_6ghz_active(self, reg_output: str) -> bool:
+        """
+        Checks if 6-GHz band (5945-6425 MHz) is enabled in regdom output without DISABLED.
+        """
+        # Pattern for 6 GHz range: 5945 - 6425
+        match = re.search(r"\(\s*5945\s*-\s*6425[^)]*\),\s*\([^)]*\)", reg_output)
+        if match:
+            line = match.group(0)
+            return "DISABLED" not in line
+        return False
+
+    def has_self_managed_phys(self, reg_output: str) -> List[str]:
+        """Finds any self-managed PHYs in iw reg get output."""
+        return re.findall(r"(phy#\d+)\s*\(self-managed\)", reg_output)
+
+    def apply_regdom(
+        self,
+        country: str,
+        manifest_mgr: ManifestManager,
+        manifest_data: Dict[str, Any],
+    ) -> List[str]:
+        """Sets persistent and runtime regulatory domain to country."""
+        actions: List[str] = []
+
+        curr_country, curr_output = self.get_current_regdom()
+        prev_state = manifest_data.setdefault("previous_state", {})
+        if "regdom" not in prev_state:
+            prev_state["regdom"] = curr_country
+
+        # 1. Update /etc/conf.d/wireless-regdom
+        conf_path = self.executor.resolve_path(REGDOM_CONF_REL)
+        manifest_mgr.backup_file(conf_path, manifest_data)
+
+        target_line = f'WIRELESS_REGDOM="{country}"\n'
+        if conf_path.exists():
+            original_text = conf_path.read_text(encoding="utf-8")
+            if re.search(r"^\s*WIRELESS_REGDOM=", original_text, re.MULTILINE):
+                new_text = re.sub(
+                    r"^\s*WIRELESS_REGDOM=.*$",
+                    f'WIRELESS_REGDOM="{country}"',
+                    original_text,
+                    flags=re.MULTILINE,
+                )
+            else:
+                new_text = original_text + "\n" + target_line
+        else:
+            new_text = f"# Erstellt von {TOOL_NAME}\n{target_line}"
+
+        self.executor.write_file(conf_path, new_text)
+        actions.append(f"Konfigurationsdatei aktualisiert: {conf_path} (WIRELESS_REGDOM=\"{country}\")")
+
+        # 2. Modprobe fallback: /etc/modprobe.d/steamframe-regdom.conf
+        modprobe_path = self.executor.resolve_path(MODPROBE_CONF_REL)
+        manifest_mgr.record_created_file(modprobe_path, manifest_data)
+        modprobe_content = (
+            f"# Erstellt von {TOOL_NAME}\n"
+            f"# Persistente Zuweisung des Regdoms fuer cfg80211\n"
+            f"options cfg80211 ieee80211_regdom={country}\n"
+        )
+        self.executor.write_file(modprobe_path, modprobe_content)
+        actions.append(f"Modprobe-Fallback angelegt: {modprobe_path}")
+
+        # 3. Systemd oneshot unit fallback
+        systemd_path = self.executor.resolve_path(SYSTEMD_UNIT_REL)
+        manifest_mgr.record_created_file(systemd_path, manifest_data)
+        unit_content = (
+            f"[Unit]\n"
+            f"Description=SteamFrame Wireless Regulatory Domain ({country})\n"
+            f"After=network-pre.target\n"
+            f"Wants=network-pre.target\n\n"
+            f"[Service]\n"
+            f"Type=oneshot\n"
+            f"RemainAfterExit=yes\n"
+            f"ExecStart=/usr/bin/iw reg set {country}\n\n"
+            f"[Install]\n"
+            f"WantedBy=multi-user.target\n"
+        )
+        self.executor.write_file(systemd_path, unit_content)
+        # Enable unit via systemctl if real root
+        if not self.executor.dry_run and self.executor.root == Path("/"):
+            self.executor.run_cmd(["systemctl", "daemon-reload"])
+            self.executor.run_cmd(["systemctl", "enable", "steamframe-regdom.service"])
+        actions.append(f"Systemd-Unit angelegt und aktiviert: {systemd_path}")
+
+        # 4. Runtime apply
+        res_iw = self.executor.run_cmd(["iw", "reg", "set", country])
+        if res_iw.success:
+            actions.append(f"Laufzeit-Regdom gesetzt: 'iw reg set {country}'")
+        else:
+            actions.append(f"Hinweis: 'iw reg set {country}' meldete: {res_iw.stderr.strip()}")
+
+        # 5. Verification
+        new_country, new_output = self.get_current_regdom()
+        if new_country == country:
+            actions.append(f"Verifikation: Globaler Regdom ist jetzt '{country}'.")
+        else:
+            actions.append(f"Warnung: Regdom nach Setzen meldet '{new_country}' statt '{country}'.")
+
+        if self.check_6ghz_active(new_output):
+            actions.append("Verifikation: 6-GHz-Frequenzbereich (5945-6425 MHz) ist aktiv!")
+        else:
+            actions.append("Warnung: 6-GHz-Frequenzbereich ist in iw reg get nicht aktiv.")
+
+        self_phys = self.has_self_managed_phys(new_output)
+        if self_phys:
+            actions.append(f"Hinweis: Gefundene self-managed PHYs: {', '.join(self_phys)} (Hardware steuert Bänder autonom).")
+
+        return actions
+
+    def revert_regdom(self, manifest_data: Dict[str, Any]) -> List[str]:
+        """Reverts regdom files and sets previous regdom."""
+        reverted: List[str] = []
+
+        # Disable systemd service
+        if not self.executor.dry_run and self.executor.root == Path("/"):
+            self.executor.run_cmd(["systemctl", "disable", "--now", "steamframe-regdom.service"])
+            self.executor.run_cmd(["systemctl", "daemon-reload"])
+
+        # Revert runtime regdom
+        prev_country = manifest_data.get("previous_state", {}).get("regdom", "00")
+        if prev_country and prev_country != "UNKNOWN":
+            res_iw = self.executor.run_cmd(["iw", "reg", "set", prev_country])
+            if res_iw.success:
+                reverted.append(f"Laufzeit-Regdom zurückgesetzt auf '{prev_country}'")
+
+        return reverted
+
+# ==============================================================================
+# Latency & NetworkManager Manager
+# ==============================================================================
+
+class LatencyManager:
+    """Configures NetworkManager and Wi-Fi interface for low latency (no powersave, no bgscan)."""
+
+    def __init__(self, executor: SystemExecutor):
+        self.executor = executor
+
+    def apply_latency_tweaks(
+        self,
+        iface: Optional[str],
+        manifest_mgr: ManifestManager,
+        manifest_data: Dict[str, Any],
+    ) -> List[str]:
+        """Applies persistent NetworkManager configs and runtime powersave disabling."""
+        actions: List[str] = []
+
+        # 1. NetworkManager configuration
+        nm_conf_path = self.executor.resolve_path(NM_CONF_REL)
+        manifest_mgr.record_created_file(nm_conf_path, manifest_data)
+
+        # Match specific interface if known, otherwise match driver rtw89
+        match_spec = f"interface-name:{iface}" if iface else "driver:rtw89*"
+        nm_conf_content = (
+            f"# Erstellt von {TOOL_NAME}\n"
+            f"[connection-steamframe-powersave]\n"
+            f"match-device={match_spec}\n"
+            f"wifi.powersave=2\n"  # 2 = disable powersave in NetworkManager
+        )
+        self.executor.write_file(nm_conf_path, nm_conf_content)
+        actions.append(f"NetworkManager-Powersave-Konfiguration erstellt: {nm_conf_path}")
+
+        # 2. NetworkManager Dispatcher script
+        dispatcher_path = self.executor.resolve_path(NM_DISPATCHER_REL)
+        manifest_mgr.record_created_file(dispatcher_path, manifest_data)
+
+        target_iface_str = iface or ""
+        dispatcher_content = f"""#!/usr/bin/env bash
+# Erstellt von {TOOL_NAME}
+# Hotplug- und Verbindungs-Handler fuer Valve Steam Frame Dongle
+IFACE="$1"
+ACTION="$2"
+TARGET_IFACE="{target_iface_str}"
+
+case "$ACTION" in
+    up|dhcp4-change|reapply)
+        IS_MATCH=0
+        if [ -n "$TARGET_IFACE" ] && [ "$IFACE" = "$TARGET_IFACE" ]; then
+            IS_MATCH=1
+        elif [ -e "/sys/class/net/$IFACE/device/driver" ]; then
+            DRIVER=$(basename "$(readlink -f "/sys/class/net/$IFACE/device/driver" 2>/dev/null)" 2>/dev/null)
+            case "$DRIVER" in
+                rtw89*) IS_MATCH=1 ;;
+            esac
+        fi
+
+        if [ "$IS_MATCH" -eq 1 ]; then
+            # Powersave deaktivieren
+            if command -v iw >/dev/null 2>&1; then
+                iw dev "$IFACE" set power_save off 2>/dev/null || true
+            fi
+
+            # wpa_cli bgscan Unterdrueckung versuchen (falls erreichbar)
+            if command -v wpa_cli >/dev/null 2>&1; then
+                wpa_cli -i "$IFACE" set_network 0 bgscan '""' 2>/dev/null || true
+            fi
+        fi
+        ;;
+esac
+"""
+        self.executor.write_file(dispatcher_path, dispatcher_content, mode=0o755)
+        actions.append(f"NetworkManager-Dispatcher-Skript erstellt: {dispatcher_path}")
+
+        # Reload NetworkManager conf
+        if not self.executor.dry_run and self.executor.root == Path("/"):
+            self.executor.run_cmd(["nmcli", "general", "reload", "conf"])
+            actions.append("NetworkManager-Konfiguration neu geladen (nmcli general reload conf)")
+
+        # 3. Runtime tweak if interface is currently present
+        if iface:
+            res_ps = self.executor.run_cmd(["iw", "dev", iface, "set", "power_save", "off"])
+            if res_ps.success:
+                actions.append(f"Laufzeit-Powersave für '{iface}' erfolgreich deaktiviert (iw dev {iface} set power_save off)")
+            else:
+                actions.append(f"Hinweis: Konnte Powersave für '{iface}' jetzt nicht setzen: {res_ps.stderr.strip()}")
+
+            # Test wpa_cli reachability
+            res_ping = self.executor.run_cmd(["wpa_cli", "-i", iface, "ping"])
+            if res_ping.success and "PONG" in res_ping.stdout:
+                res_bg = self.executor.run_cmd(["wpa_cli", "-i", iface, "set_network", "0", "bgscan", '""'])
+                if res_bg.success:
+                    actions.append(f"wpa_cli bgscan für '{iface}' erfolgreich deaktiviert.")
+            else:
+                actions.append(
+                    f"Hinweis: wpa_cli Steuer-Interface für '{iface}' antwortet nicht (normal unter NetworkManager). "
+                    "Scan-Unterdrückung wird zuverlässig über Dispatcher & Headset-BSSID gehandhabt."
+                )
+
+        return actions
+
+# ==============================================================================
+# Steam Launcher & Client Manager
+# ==============================================================================
+
+class SteamManager:
+    """Creates user-level Steam wrapper and desktop entry."""
+
+    def __init__(self, executor: SystemExecutor):
+        self.executor = executor
+
+    def check_steam_environment(self) -> Tuple[bool, bool]:
+        """
+        Returns (has_native_steam, has_flatpak_steam).
+        """
+        has_native = self.executor.resolve_path("usr/bin/steam").exists()
+        res_flatpak = self.executor.run_cmd(
+            ["flatpak", "info", "com.valvesoftware.Steam"],
+            simulate_in_dry_run=True,
+        )
+        has_flatpak = res_flatpak.returncode == 0
+        return has_native, has_flatpak
+
+    def apply_steam_wrapper(
+        self,
+        manifest_mgr: ManifestManager,
+        manifest_data: Dict[str, Any],
+    ) -> List[str]:
+        """Creates ~/.local/bin/steam-frame and desktop file for $SUDO_USER."""
+        actions: List[str] = []
+        has_native, has_flatpak = self.check_steam_environment()
+
+        if has_flatpak:
+            print(
+                Colors.colorize(
+                    "WARNUNG: Steam wurde als Flatpak erkannt!\n"
+                    "VRLink und der 32-Bit-Treiber-Watchdog funktionieren nur mit nativem Steam zuverlässig.\n"
+                    "Empfehlung: Installieren Sie 'steam' nativ via pacman (multilib).",
+                    Colors.YELLOW,
+                )
+            )
+
+        username, user_home, uid, gid = get_target_user(self.executor)
+
+        # 1. Wrapper Script
+        wrapper_dir = user_home / ".local" / "bin"
+        wrapper_path = wrapper_dir / "steam-frame"
+        manifest_mgr.record_created_file(wrapper_path, manifest_data)
+
+        wrapper_content = """#!/usr/bin/env bash
+# Steam-Frame Launcher fuer Valve Steam Frame / VRLink
+# Erzwingt PipeWire und VRLink-Treiber (Workaround fuer 32-Bit-Watchdog)
+exec steam -pipewire -vrlinkforceenable "$@"
+"""
+        self.executor.write_file(wrapper_path, wrapper_content, mode=0o755)
+
+        # 2. Desktop Entry
+        apps_dir = user_home / ".local" / "share" / "applications"
+        desktop_path = apps_dir / "steam-frame.desktop"
+        manifest_mgr.record_created_file(desktop_path, manifest_data)
+
+        desktop_content = f"""[Desktop Entry]
+Name=Steam (Frame / VRLink)
+Comment=Steam mit PipeWire und erzwungenem VRLink starten
+Exec={wrapper_path} %U
+Icon=steam
+Terminal=false
+Type=Application
+Categories=Game;Network;
+MimeType=x-scheme-handler/steam;x-scheme-handler/steamlink;
+"""
+        self.executor.write_file(desktop_path, desktop_content, mode=0o644)
+
+        # Set user ownership if running on real filesystem as root
+        if not self.executor.dry_run and os.geteuid() == 0:
+            for p in (wrapper_path, desktop_path):
+                try:
+                    os.chown(p, uid, gid)
+                except Exception as e:
+                    self.executor.logger.warning(f"Could not chown {p} to {uid}:{gid}: {e}")
+
+        actions.append(f"Benutzer-Wrapper erstellt: {wrapper_path}")
+        actions.append(f"Desktop-Eintrag erstellt: {desktop_path} (Benutzer: {username})")
+        return actions
+
+# ==============================================================================
+# Engine: Apply, Undo, Status, Check
+# ==============================================================================
+
+class SetupEngine:
+    """Main orchestrator for apply, undo, status, and check commands."""
+
+    def __init__(self, executor: SystemExecutor):
+        self.executor = executor
+        self.manifest_mgr = ManifestManager(executor)
+        self.detector = DongleDetector(executor)
+        self.firewall = FirewallManager(executor)
+        self.regdom = RegdomManager(executor)
+        self.latency = LatencyManager(executor)
+        self.steam = SteamManager(executor)
+
+    def print_checklist(self) -> None:
+        """Prints the mandatory manual checklist."""
+        box = f"""
+{Colors.BOLD}{Colors.CYAN}════════════════════════════════════════════════════════════════════════════════
+                     MANUELLE CHECKLISTE (Nicht automatisierbar)
+════════════════════════════════════════════════════════════════════════════════{Colors.RESET}
+ 1. {Colors.BOLD}BETA-KANAL AKTIVIEREN:{Colors.RESET}
+    - {Colors.BOLD}Steam-Client:{Colors.RESET} Einstellungen -> Schnittstelle -> Beta-Teilnahme -> 'Steam Beta Update'
+    - {Colors.BOLD}SteamVR:{Colors.RESET} Bibliothek -> Rechtsklick auf SteamVR -> Eigenschaften -> Betas -> 'beta - SteamVR Beta Update'
+    - {Colors.BOLD}Headset-OS:{Colors.RESET} In den Systemeinstellungen des Headsets den Beta-Kanal aktivieren.
+
+ 2. {Colors.BOLD}STARTREIHENFOLGE BEACHTEN:{Colors.RESET}
+    - Zuerst Steam über '{Colors.GREEN}steam-frame{Colors.RESET}' starten (bzw. den Desktop-Eintrag 'Steam (Frame / VRLink)').
+    - SteamVR am Desktop starten.
+    - {Colors.BOLD}Erst DANACH{Colors.RESET} das Headset einschalten (Punkt-zu-Punkt Direct Connect).
+
+ 3. {Colors.BOLD}BEI INSTABILITÄT / RUCKLERN:{Colors.RESET}
+    - SteamRT3 (Steam Linux Runtime 3.0) deaktivieren, falls Abstürze auftreten.
+    - NetworkManager BSSID-Pinning: Sobald das Headset gekoppelt ist, die Headset-BSSID fest
+      im NM-Verbindungsprofil hinterlegen ({Colors.DIM}nmcli connection modify <SSID> 802-11-wireless.bssid <BSSID>{Colors.RESET}),
+      um periodische Roaming-Hintergrundscans vollständig zu eliminieren.
+{Colors.BOLD}{Colors.CYAN}════════════════════════════════════════════════════════════════════════════════{Colors.RESET}
+"""
+        print(box)
+
+    def pre_checks(self) -> None:
+        """Runs pre-execution checks and issues warnings."""
+        # 1. Root check
+        if os.geteuid() != 0 and self.executor.root == Path("/") and not self.executor.dry_run:
+            print(Colors.colorize("FEHLER: 'steamframe-setup' benötigt Root-Rechte (bitte mit 'sudo steamframe-setup' ausführen).", Colors.RED))
+            sys.exit(1)
+
+        # 2. Kernel check
+        res_kernel = self.executor.run_cmd(["uname", "-r"], simulate_in_dry_run=True)
+        if res_kernel.success:
+            kver = res_kernel.stdout.strip()
+            # Parse major.minor
+            m = re.match(r"^(\d+)\.(\d+)", kver)
+            if m:
+                major, minor = int(m.group(1)), int(m.group(2))
+                if (major < 7) or (major == 7 and minor < 2):
+                    print(Colors.colorize(f"HINWEIS / WARNUNG: Kernel {kver} erkannt. Die Recherche empfiehlt Kernel 7.2+ für optimale rtw89 6-GHz-Stabilität.", Colors.YELLOW))
+
+        # 3. Game-devices-udev check
+        res_udev = self.executor.run_cmd(["pacman", "-Q", "game-devices-udev"], simulate_in_dry_run=True)
+        if res_udev.returncode != 0:
+            print(Colors.colorize("HINWEIS: Paket 'game-devices-udev' ist nicht installiert. (Unter CachyOS für VR-Controller-udev-Rechte empfohlen).", Colors.YELLOW))
+
+    def apply(self, args: argparse.Namespace) -> int:
+        """Executes the full apply workflow."""
+        self.pre_checks()
+
+        print(Colors.colorize(f"\n=== Starte steamframe-setup (Version {VERSION}) ===", Colors.BOLD))
+        if self.executor.dry_run:
+            print(Colors.colorize(">>> DRY-RUN MODUS: Keine Änderungen werden auf das System angewendet <<<", Colors.YELLOW))
+
+        # 1. Dongle detection
+        interactive = not args.yes
+        dongle = self.detector.find_dongle(requested_iface=args.iface, interactive=interactive)
+        iface_name = dongle.iface if dongle else None
+
+        if dongle:
+            print(Colors.colorize(f"Dongle-Schnittstelle erkannt: {dongle.iface} (Treiber: {dongle.driver}, Bus: {dongle.bus})", Colors.GREEN))
+        else:
+            print(Colors.colorize("Kein rtw89-Dongle verbunden. Schnittstellen-unabhängige Anpassungen werden durchgeführt.", Colors.YELLOW))
+            if args.ufw_scope == "iface":
+                print(Colors.colorize("Hinweis: UFW-Scope 'iface' erfordert eine Schnittstelle. Verwenden Sie ggf. '--ufw-scope all' oder stecken Sie den Dongle ein.", Colors.YELLOW))
+
+        # Summary of planned actions
+        country = args.country.upper()
+        print("\nGeplante Anpassungen:")
+        print(f"  • Regulatorische Domäne: '{country}' (persistent & laufend, Fallbacks für cfg80211)")
+        print(f"  • Firewall: UFW VRLink-Ports (Scope: {args.ufw_scope})")
+        print("  • Latenz & Powersave: NM-Powersave aus, NM-Dispatcher für Scan-Unterdrückung")
+        print("  • Steam-Launcher: Wrapper (~/.local/bin/steam-frame) und Desktop-Datei")
+
+        if not args.yes and not self.executor.dry_run:
+            try:
+                confirm = input("\nMöchten Sie diese Anpassungen anwenden? [j/N]: ").strip().lower()
+                if confirm not in ("j", "ja", "y", "yes"):
+                    print("Abgebrochen durch Benutzer.")
+                    return 0
+            except (KeyboardInterrupt, EOFError):
+                sys.exit(1)
+
+        # Load or initialize manifest
+        manifest_data = self.manifest_mgr.load_manifest()
+        if not manifest_data:
+            manifest_data = {
+                "version": VERSION,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "country": country,
+                "iface": iface_name,
+                "ufw_scope": args.ufw_scope,
+                "created_files": [],
+                "modified_files": {},
+                "ufw_rules": [],
+                "installed_packages": [],
+                "previous_state": {},
+            }
+
+        # Step 2: Package check
+        self.regdom.check_and_install_package(
+            auto_yes=args.yes,
+            interactive=interactive,
+            manifest_mgr=self.manifest_mgr,
+            manifest_data=manifest_data,
+        )
+
+        # Step 3: Regdom
+        print(Colors.colorize("\n[1/4] Konfiguriere Regulatorische Domäne...", Colors.BLUE))
+        reg_actions = self.regdom.apply_regdom(country, self.manifest_mgr, manifest_data)
+        for act in reg_actions:
+            print(f"  ✓ {act}")
+
+        # Step 4: Firewall
+        print(Colors.colorize("\n[2/4] Konfiguriere Firewall (UFW)...", Colors.BLUE))
+        fw_actions = self.firewall.apply_rules(args.ufw_scope, iface_name, self.manifest_mgr, manifest_data)
+        for act in fw_actions:
+            print(f"  ✓ {act}")
+        if not fw_actions:
+            print("  (Keine neuen UFW-Regeln erforderlich oder UFW inaktiv)")
+
+        # Step 5: Latency & Powersave
+        print(Colors.colorize("\n[3/4] Optimiere Latenz & Powersave...", Colors.BLUE))
+        lat_actions = self.latency.apply_latency_tweaks(iface_name, self.manifest_mgr, manifest_data)
+        for act in lat_actions:
+            print(f"  ✓ {act}")
+
+        # Step 6: Steam Launcher
+        print(Colors.colorize("\n[4/4] Erstelle Steam-Launcher...", Colors.BLUE))
+        steam_actions = self.steam.apply_steam_wrapper(self.manifest_mgr, manifest_data)
+        for act in steam_actions:
+            print(f"  ✓ {act}")
+
+        # Save manifest
+        self.manifest_mgr.save_manifest(manifest_data)
+        print(Colors.colorize(f"\nManifest erfolgreich gespeichert: {self.manifest_mgr.manifest_path}", Colors.GREEN))
+
+        # Checklist
+        self.print_checklist()
+        print(Colors.colorize("Einrichtung abgeschlossen! Rückgängigmachen jederzeit mit: sudo steamframe-setup undo\n", Colors.BOLD))
+        return 0
+
+    def undo(self, args: argparse.Namespace) -> int:
+        """Rolls back all changes exactly based on manifest."""
+        manifest_data = self.manifest_mgr.load_manifest()
+
+        if not manifest_data:
+            print(Colors.colorize(f"Kein Manifest unter '{self.manifest_mgr.manifest_path}' gefunden. Es wurden noch keine Änderungen durch dieses Tool angewendet.", Colors.YELLOW))
+            return 0
+
+        if os.geteuid() != 0 and self.executor.root == Path("/") and not self.executor.dry_run:
+            print(Colors.colorize("FEHLER: 'steamframe-setup undo' benötigt Root-Rechte (bitte mit 'sudo steamframe-setup undo' ausführen).", Colors.RED))
+            sys.exit(1)
+
+        print(Colors.colorize(f"\n=== Starte steamframe-setup undo (Version {VERSION}) ===", Colors.BOLD))
+        if self.executor.dry_run:
+            print(Colors.colorize(">>> DRY-RUN MODUS: Keine Änderungen werden physisch rückgängig gemacht <<<", Colors.YELLOW))
+
+        created_files = manifest_data.get("created_files", [])
+        modified_files = manifest_data.get("modified_files", {})
+        ufw_rules = manifest_data.get("ufw_rules", [])
+        installed_packages = manifest_data.get("installed_packages", [])
+
+        print("\nFolgende Änderungen werden exakt zurückgesetzt:")
+        print(f"  • {len(ufw_rules)} UFW-Regeln entfernen")
+        print(f"  • {len(modified_files)} geänderte Dateien aus Backup wiederherstellen")
+        print(f"  • {len(created_files)} erstellte Dateien / Units löschen")
+        if installed_packages:
+            print(f"  • Installierte Pakete: {', '.join(installed_packages)}")
+
+        if not args.yes and not self.executor.dry_run:
+            try:
+                ans = input("\nMöchten Sie alle Änderungen jetzt zurücksetzen? [j/N]: ").strip().lower()
+                if ans not in ("j", "ja", "y", "yes"):
+                    print("Abgebrochen durch Benutzer.")
+                    return 0
+            except (KeyboardInterrupt, EOFError):
+                sys.exit(1)
+
+        # 1. Revert UFW rules
+        print(Colors.colorize("\n[1/5] Setze UFW-Regeln zurück...", Colors.BLUE))
+        fw_reverted = self.firewall.revert_rules(manifest_data)
+        for r in fw_reverted:
+            print(f"  ✓ {r}")
+
+        # 2. Revert modified files
+        print(Colors.colorize("\n[2/5] Stelle geänderte Dateien aus Backups wieder her...", Colors.BLUE))
+        for file_str, meta in modified_files.items():
+            target_file = Path(file_str)
+            backup_path_str = meta.get("backup_path")
+            existed_before = meta.get("existed_before", True)
+
+            if not existed_before:
+                if target_file.exists():
+                    self.executor.remove_file(target_file)
+                    print(f"  ✓ {target_file} gelöscht (existierte vor apply nicht)")
+            elif backup_path_str:
+                backup_file = Path(backup_path_str)
+                if backup_file.exists():
+                    if not self.executor.dry_run:
+                        shutil.copy2(backup_file, target_file)
+                    print(f"  ✓ {target_file} aus Backup {backup_file.name} wiederhergestellt")
+                else:
+                    print(Colors.colorize(f"  ! Backup-Datei {backup_path_str} nicht gefunden (übersprungen)", Colors.YELLOW))
+
+        # 3. Remove created files
+        print(Colors.colorize("\n[3/5] Lösche vom Tool erstellte Dateien & Units...", Colors.BLUE))
+        for file_str in created_files:
+            target_file = Path(file_str)
+            if target_file.exists():
+                self.executor.remove_file(target_file)
+                print(f"  ✓ Gelöscht: {target_file}")
+            else:
+                print(f"  - {target_file} existiert bereits nicht mehr (übersprungen)")
+
+        # 4. Revert Regdom & reload services
+        print(Colors.colorize("\n[4/5] Setze Regdom zurück und lade Dienste neu...", Colors.BLUE))
+        reg_reverted = self.regdom.revert_regdom(manifest_data)
+        for r in reg_reverted:
+            print(f"  ✓ {r}")
+
+        # Reload NetworkManager if NM config was deleted
+        if not self.executor.dry_run and self.executor.root == Path("/"):
+            self.executor.run_cmd(["nmcli", "general", "reload", "conf"])
+            print("  ✓ NetworkManager-Konfiguration neu geladen")
+
+        # 5. Handle installed packages
+        print(Colors.colorize("\n[5/5] Behandle installierte Pakete...", Colors.BLUE))
+        for pkg in installed_packages:
+            remove_pkg = args.remove_packages
+            if not remove_pkg and not args.yes and not self.executor.dry_run:
+                try:
+                    q = input(f"Soll das durch das Tool installierte Paket '{pkg}' deinstalliert werden? [j/N]: ").strip().lower()
+                    if q in ("j", "ja", "y", "yes"):
+                        remove_pkg = True
+                except (KeyboardInterrupt, EOFError):
+                    pass
+
+            if remove_pkg:
+                res_rm = self.executor.run_cmd(["pacman", "-R", "--noconfirm", pkg])
+                if res_rm.success:
+                    print(Colors.colorize(f"  ✓ Paket '{pkg}' erfolgreich deinstalliert.", Colors.GREEN))
+                else:
+                    print(Colors.colorize(f"  ! Konnte '{pkg}' nicht deinstallieren: {res_rm.stderr.strip()}", Colors.YELLOW))
+            else:
+                print(f"  - Paket '{pkg}' wurde beibehalten.")
+
+        # Clean up manifest
+        self.manifest_mgr.remove_manifest_and_backups()
+        print(Colors.colorize("\nManifest und Backup-Dateien wurden vollständig bereinigt.", Colors.GREEN))
+        print(Colors.colorize("Undo erfolgreich abgeschlossen: System ist wieder im Ursprungszustand!\n", Colors.BOLD))
+        return 0
+
+    def status(self, args: argparse.Namespace) -> int:
+        """Inspects and reports system status and applied tweaks."""
+        items: List[CheckItem] = []
+
+        # 1. Kernel & rtw89 Module
+        res_kernel = self.executor.run_cmd(["uname", "-r"], simulate_in_dry_run=True)
+        kver = res_kernel.stdout.strip()
+        k_status = "OK"
+        k_msg = f"Kernel {kver}"
+        m = re.match(r"^(\d+)\.(\d+)", kver)
+        if m and ((int(m.group(1)) < 7) or (int(m.group(1)) == 7 and int(m.group(2)) < 2)):
+            k_status = "WARN"
+            k_msg += " (Recherche empfiehlt 7.2+)"
+        items.append(CheckItem("System", "Kernel-Version", k_status, k_msg))
+
+        # Check rtw89 kernel driver presence
+        res_mod = self.executor.run_cmd(["modinfo", "rtw89_core"], simulate_in_dry_run=True)
+        if res_mod.returncode == 0:
+            items.append(CheckItem("System", "rtw89-Treiber-Modul", "OK", "Im Kernel vorhanden"))
+        else:
+            items.append(CheckItem("System", "rtw89-Treiber-Modul", "WARN", "Modul 'rtw89_core' nicht gefunden"))
+
+        # game-devices-udev
+        res_udev = self.executor.run_cmd(["pacman", "-Q", "game-devices-udev"], simulate_in_dry_run=True)
+        if res_udev.returncode == 0:
+            items.append(CheckItem("System", "game-devices-udev", "OK", "Installiert"))
+        else:
+            items.append(CheckItem("System", "game-devices-udev", "WARN", "Nicht installiert (optional für CachyOS)"))
+
+        # 2. Dongle Interface
+        all_ifaces = self.detector.scan_interfaces()
+        dongle = self.detector.find_dongle(requested_iface=args.iface, interactive=False)
+        if dongle:
+            items.append(CheckItem("Dongle", "Schnittstelle", "OK", f"{dongle.iface} (Treiber: {dongle.driver}, Bus: {dongle.bus})"))
+
+            # Check powersave runtime
+            res_ps = self.executor.run_cmd(["iw", "dev", dongle.iface, "get", "power_save"], simulate_in_dry_run=True)
+            if "Power save: off" in res_ps.stdout:
+                items.append(CheckItem("Dongle", "Wi-Fi Powersave", "OK", "Deaktiviert (optimal)"))
+            elif "Power save: on" in res_ps.stdout:
+                items.append(CheckItem("Dongle", "Wi-Fi Powersave", "WARN", "Aktiv (verursacht Latenzspitzen!)"))
+            else:
+                items.append(CheckItem("Dongle", "Wi-Fi Powersave", "WARN", "Konnte nicht ermittelt werden"))
+        else:
+            items.append(CheckItem("Dongle", "Schnittstelle", "WARN", "Kein rtw89-Dongle angeschlossen"))
+
+        # 3. Regulatory Domain
+        res_regpkg = self.executor.run_cmd(["pacman", "-Q", "wireless-regdb"], simulate_in_dry_run=True)
+        if res_regpkg.returncode == 0:
+            items.append(CheckItem("Regdom", "Paket wireless-regdb", "OK", "Installiert"))
+        else:
+            items.append(CheckItem("Regdom", "Paket wireless-regdb", "WARN", "Fehlt (6 GHz evtl. gesperrt)"))
+
+        reg_conf = self.executor.resolve_path(REGDOM_CONF_REL)
+        if reg_conf.exists():
+            text = reg_conf.read_text(encoding="utf-8")
+            m_reg = re.search(r'^\s*WIRELESS_REGDOM="?([A-Z0-9]+)"?', text, re.MULTILINE)
+            if m_reg:
+                items.append(CheckItem("Regdom", "conf.d/wireless-regdom", "OK", f"Gesetzt auf {m_reg.group(1)}"))
+            else:
+                items.append(CheckItem("Regdom", "conf.d/wireless-regdom", "UNAPPLIED", "Nicht konfiguriert"))
+        else:
+            items.append(CheckItem("Regdom", "conf.d/wireless-regdom", "UNAPPLIED", "Datei existiert nicht"))
+
+        country, reg_output = self.regdom.get_current_regdom()
+        is_6g = self.regdom.check_6ghz_active(reg_output)
+        items.append(CheckItem("Regdom", "Laufzeit-Regdom", "OK" if country != "00" else "WARN", f"Global: {country}"))
+        items.append(CheckItem("Regdom", "6-GHz-Frequenzbereich", "OK" if is_6g else "WARN", "Aktiv (5945-6425 MHz)" if is_6g else "Inaktiv oder gedrosselt"))
+
+        self_phys = self.regdom.has_self_managed_phys(reg_output)
+        if self_phys:
+            items.append(CheckItem("Regdom", "Self-Managed PHYs", "WARN", f"{', '.join(self_phys)} (Hardware-Regeln aktiv)"))
+
+        # 4. Firewall (UFW)
+        fw_type = self.firewall.detect_active_firewall()
+        items.append(CheckItem("Firewall", "Aktiver Dienst", "OK" if fw_type == "ufw" else "INFO", f"Erkannt: {fw_type}"))
+
+        if fw_type == "ufw":
+            rules = self.firewall.get_existing_ufw_rules()
+            missing_ports = []
+            for p in VRLINK_PORTS:
+                if not self.firewall.is_rule_present(p["port"], p["proto"], "all", None, rules):
+                    missing_ports.append(f"{p['port']}/{p['proto']}")
+            if not missing_ports:
+                items.append(CheckItem("Firewall", "VRLink-Portfreigaben", "OK", "Alle Ports in UFW erlaubt"))
+            else:
+                items.append(CheckItem("Firewall", "VRLink-Portfreigaben", "UNAPPLIED", f"Fehlende Ports: {', '.join(missing_ports)}"))
+
+        # 5. NetworkManager & Latency
+        nm_conf = self.executor.resolve_path(NM_CONF_REL)
+        items.append(CheckItem("Latenz", "NM-Powersave-Konfiguration", "OK" if nm_conf.exists() else "UNAPPLIED", "Vorhanden" if nm_conf.exists() else "Nicht vorhanden"))
+
+        dispatcher = self.executor.resolve_path(NM_DISPATCHER_REL)
+        items.append(CheckItem("Latenz", "NM-Dispatcher-Skript", "OK" if dispatcher.exists() else "UNAPPLIED", "Vorhanden" if dispatcher.exists() else "Nicht vorhanden"))
+
+        # 6. Steam Launcher
+        has_native, has_flatpak = self.steam.check_steam_environment()
+        if has_native:
+            items.append(CheckItem("Steam", "Installationstyp", "OK", "Natives Steam (/usr/bin/steam)"))
+        elif has_flatpak:
+            items.append(CheckItem("Steam", "Installationstyp", "WARN", "Flatpak erkannt (nicht empfohlen!)"))
+        else:
+            items.append(CheckItem("Steam", "Installationstyp", "WARN", "Kein Steam gefunden"))
+
+        _, user_home, _, _ = get_target_user(self.executor)
+        wrapper = user_home / ".local" / "bin" / "steam-frame"
+        desktop = user_home / ".local" / "share" / "applications" / "steam-frame.desktop"
+        items.append(CheckItem("Steam", "Wrapper-Skript", "OK" if wrapper.exists() else "UNAPPLIED", str(wrapper) if wrapper.exists() else "Nicht vorhanden"))
+        items.append(CheckItem("Steam", "Desktop-Eintrag", "OK" if desktop.exists() else "UNAPPLIED", str(desktop) if desktop.exists() else "Nicht vorhanden"))
+
+        # 7. Manifest
+        manifest = self.manifest_mgr.load_manifest()
+        if manifest:
+            items.append(CheckItem("Manifest", "Setup-Status", "OK", f"Angewendet am {manifest.get('created_at', '?')}"))
+        else:
+            items.append(CheckItem("Manifest", "Setup-Status", "UNAPPLIED", "Nicht angewendet (kein Manifest)"))
+
+        # Print formatted table
+        print(f"\n{Colors.BOLD}{Colors.CYAN}=== Status & Diagnose: Valve Steam Frame / VRLink ==={Colors.RESET}\n")
+        current_cat = ""
+        for item in items:
+            if item.category != current_cat:
+                current_cat = item.category
+                print(f"{Colors.BOLD}--- {current_cat} ---{Colors.RESET}")
+
+            if item.status == "OK":
+                tag = Colors.colorize("[  ANGEWENDET  ]", Colors.GREEN)
+            elif item.status == "WARN":
+                tag = Colors.colorize("[   WARNUNG    ]", Colors.YELLOW)
+            elif item.status == "UNAPPLIED":
+                tag = Colors.colorize("[NICHT ANGEWANDT]", Colors.DIM)
+            elif item.status == "DIVERGENT":
+                tag = Colors.colorize("[  ABWEICHEND  ]", Colors.RED)
+            else:
+                tag = Colors.colorize(f"[{item.status:^14}]", Colors.BLUE)
+
+            print(f"  {tag} {item.name:<28} : {item.message}")
+        print()
+        return 0
+
+# ==============================================================================
+# Logging Setup
+# ==============================================================================
+
+def setup_logging(executor: SystemExecutor) -> None:
+    """Configures structured file logging and console handler."""
+    log_path = executor.resolve_path(LOG_REL_PATH)
+    logger = logging.getLogger(TOOL_NAME)
+    logger.setLevel(logging.DEBUG)
+
+    # File handler
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except Exception as e:
+        # Fallback to temp file if permission denied on /var/log/
+        try:
+            tmp_log = Path("/tmp/steamframe-setup.log")
+            fh = logging.FileHandler(tmp_log, encoding="utf-8")
+            fh.setLevel(logging.DEBUG)
+            fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+        except Exception:
+            pass
+
+# ==============================================================================
+# CLI Argument Parser & Entry Point
+# ==============================================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    # Common options that apply to all subcommands
+    common_parser = argparse.ArgumentParser(add_help=False)
+    common_parser.add_argument("--dry-run", action="store_true", help="Simuliert alle Aktionen, ohne Dateien zu schreiben oder Befehle auszuführen.")
+    common_parser.add_argument("--iface", type=str, default=None, help="Name der Dongle-WLAN-Schnittstelle (z.B. wlan1). Wird sonst automatisch ermittelt.")
+    common_parser.add_argument("--country", type=str, default=DEFAULT_COUNTRY, help=f"2-stelliger Ländercode für die Regulatorische Domäne (Standard: {DEFAULT_COUNTRY}).")
+    common_parser.add_argument("--ufw-scope", choices=["iface", "all"], default="iface", help="Scope der UFW-Regeln: 'iface' (Standard, nur auf Dongle-Interface) oder 'all'.")
+    common_parser.add_argument("-y", "--yes", action="store_true", help="Automatische Bestätigung aller Sicherheitsabfragen (nicht-interaktiver Modus).")
+    common_parser.add_argument("--root", type=str, default="/", help="Basisverzeichnis für Datei- und Systemoperationen (Standard: /, nützlich für Tests).")
+
+    parser = argparse.ArgumentParser(
+        prog=TOOL_NAME,
+        description="Automatisiertes Setup & sauberes Undo aller Systemanpassungen für den Valve Steam Frame Dongle auf CachyOS.",
+        parents=[common_parser],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Auszuführendes Kommando")
+
+    # apply
+    subparsers.add_parser(
+        "apply",
+        parents=[common_parser],
+        help="Wendet alle Systemanpassungen für Steam Frame / VRLink an.",
+    )
+
+    # undo
+    parser_undo = subparsers.add_parser(
+        "undo",
+        parents=[common_parser],
+        help="Nimmt alle durch das Tool vorgenommenen Änderungen exakt zurück.",
+    )
+    parser_undo.add_argument("--remove-packages", action="store_true", help="Entfernt auch durch das Tool installierte Pakete (z.B. wireless-regdb).")
+
+    # status
+    subparsers.add_parser(
+        "status",
+        parents=[common_parser],
+        help="Zeigt den aktuellen Zustand aller Anpassungen an.",
+    )
+
+    # check
+    subparsers.add_parser(
+        "check",
+        parents=[common_parser],
+        help="Alias für 'status' mit detaillierter Validierung.",
+    )
+
+    return parser
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    root_path = Path(args.root).resolve()
+    executor = SystemExecutor(dry_run=args.dry_run, root=root_path)
+    setup_logging(executor)
+
+    engine = SetupEngine(executor)
+
+    if args.command == "apply":
+        return engine.apply(args)
+    elif args.command == "undo":
+        return engine.undo(args)
+    elif args.command in ("status", "check"):
+        return engine.status(args)
+    else:
+        parser.print_help()
+        return 1
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nAbgebrochen durch Benutzer.")
+        sys.exit(130)
