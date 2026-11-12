@@ -66,7 +66,12 @@ chmod +x steamframe-setup
 sudo ./steamframe-setup apply
 ```
 
-### 5. Alle Änderungen exakt zurücknehmen
+### 5. Hängende SteamVR-Prozesse beenden (bei Verbindungsstörungen)
+```bash
+./steamframe-setup reset-steam
+```
+
+### 6. Alle Änderungen exakt zurücknehmen
 ```bash
 sudo ./steamframe-setup undo
 ```
@@ -78,7 +83,7 @@ sudo ./steamframe-setup undo
 ```text
 steamframe-setup [-h] [--version] [--dry-run] [--iface IFACE]
                  [--country COUNTRY] [--ufw-scope {iface,all}] [-y]
-                 [--root ROOT] {apply,undo,status,check} ...
+                 [--root ROOT] {apply,undo,status,check,reset-steam} ...
 ```
 
 ### Kommandos
@@ -88,6 +93,7 @@ steamframe-setup [-h] [--version] [--dry-run] [--iface IFACE]
 | `undo` | Nimmt alle vom Tool vorgenommenen Änderungen exakt anhand des Manifests zurück. |
 | `status` | Analysiert den aktuellen Systemzustand (`angewendet / nicht angewendet / abweichend`). |
 | `check` | Alias für `status` mit detaillierter Validierung. |
+| `reset-steam` | Beendet alle laufenden und hängenden Steam- und SteamVR-Prozesse (`vrserver`, `vrcompositor`, `steam`). |
 
 ### Globale Optionen
 | Flag | Standard | Beschreibung |
@@ -152,14 +158,40 @@ Jede durch `steamframe-setup apply` durchgeführte Systemanpassung wird in `/var
   - NetworkManager-Dispatcher-Skript `/etc/NetworkManager/dispatcher.d/99-steamframe.sh` setzt bei jedem Verbindungsaufbau (`up`, `dhcp4-change`) sofort `iw dev <iface> set power_save off` und versucht die `wpa_cli`-bgscan-Unterdrückung.
   - **Wichtigste Maßnahme gegen bgscan:** Sobald das Headset gekoppelt ist, sollte die Headset-BSSID im NetworkManager-Profil fixiert werden (siehe Checkliste).
 
-### 4. Steam-Client & VRLink
-- **Problem:** Der Watchdog versucht auf 64-Bit-Systemen fälschlich einen 32-Bit-`driver_vrlink` zu starten. Zudem blockiert Flatpak-Sandboxing Treiberpfade.
+### 4. Valve Holo Realtek Firmware Toggles (SteamOS Low-Latency Integration)
+Aus dem SteamOS/Holo-Repository von Valve (`sabae@valvesoftware.com`) stammt das Paket `holo-realtek-firmware-toggles`, das speziell für Steam Frame und `rtw89` entwickelt wurde.
+- **Warum das Paket auf Desktop-Systemen fehlte:** SteamVR/VRLink versucht dieses Tool unter SteamOS via Polkit aufzurufen. Auf Standard-Distros wie CachyOS fehlt das Tool und die Polkit-Berechtigung, wodurch der Low-Latency-Modus fehlschlägt.
+- **Was `set-low-latency-mode on` bewirkt:**
+  1. `HW_SCAN off`: Schaltet das Hardware-Hintergrundscanning im Realtek-DebugFS (`disable_dm`) aus – die eigentliche Ursache für periodische 400-ms-Spitzen!
+  2. `set-amsdu off`: `iw dev <if> set tidconf tids 0xff amsdu off` umgeht einen bekannten Treiber-Bug bei A-MSDU-Aggregation im Realtek-Treiber.
+  3. `set-mcs-rates 0-9`: Begrenzt die MCS-Raten auf den 5- und 6-GHz-Bändern (Spatial Streams 1 & 2) auf 0–9, um Rate-Thrashing und Framedrops zu verhindern.
+  4. `set-powersave off`: Deaktiviert Host-Powersave und Firmware-seitiges `INACTIVE_PS`.
+  5. `set-pd-thresh -75`: Setzt den Packet-Detection-Threshold auf -75 dBm, um entfernte Störsignale zu ignorieren.
+  6. `set-aggressive-edca on`: Schreibt aggressive Paket-Timing-Register (`c300`, `c304`, `c308`, `c30c`), analog zu Valves Windows-Treiber-Anpassung.
+- **Integration in steamframe-setup:**
+  - Installiert `/usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles` und die Polkit-Action `/usr/share/polkit-1/actions/org.valve.holo-realtek-firmware-toggles.policy`.
+  - Bindet den Aufruf an den NetworkManager-Dispatcher (`set-low-latency-mode on` bei Interface-Up, `reset` bei Interface-Down).
+  - Volle Manifest-Registrierung und sauberes Zurücksetzen bei `undo`.
+
+### 5. System-Tuning: USB-Power, Socket-Puffer, Polkit & Ananicy
+Die Recherche und Analyse von Upstream-Issues (`ValveSoftware/SteamVR-for-Linux`) ergab vier weitere kritische Stellschrauben:
+- **USB-Autosuspend (U3):** Udev-Regel `/etc/udev/rules.d/99-steamframe-usb-power.rules` bindet auf `28de:2432` (`power/control="on"`, `power/autosuspend="-1"`).
+- **Driver Powersave (`rtw89_core`):** `/etc/modprobe.d/steamframe-rtw89.conf` mit `options rtw89_core disable_ps_mode=y`.
+- **Netzwerk-Socket-Puffer (Sysctl):** `/etc/sysctl.d/99-steamframe-network.conf` hebt `rmem_max`/`wmem_max` auf 32 MB an und nutzt `-net.core.netdev_max_backlog = 10000` (container- und namespace-sicher), um VRLink UDP-Pufferüberläufe (*"FAULT: Packet too big"*) zu verhindern.
+- **Targeted Polkit Rule:** `/etc/polkit-1/rules.d/99-steamframe-networkmanager.rules` erlaubt unprivilegierten SteamVR-Sitzungen das Anlegen von P2P-Verbindungen (`settings.modify.system`, `network-control`, `wifi.share.protected`), ohne Sicherheitsrisiken einer pauschalen Freigabe.
+- **Prozess-Priorisierung (Ananicy-cpp):** `/etc/ananicy.d/99-steamframe-vr.rules` priorisiert `vrcompositor` als `LowLatency_RT`, damit anspruchsvolle Proton-Spiele die Head-Tracking-Präsentation nicht aushungern.
+
+### 6. Steam-Client, PipeWire, QT/Wayland & VRLink
+- **Problem:** Der Watchdog versucht auf 64-Bit-Systemen fälschlich einen 32-Bit-`driver_vrlink` zu starten. Zudem blockiert Flatpak-Sandboxing Treiberpfade, Audio kann knacken oder desynchronisieren, und unter Wayland-Umgebungen (KDE Plasma, Sway, Hyprland) stürzt das SteamVR-Dashboard ohne erzwungenes X11/xcb-Backend still ab.
 - **Lösung:**
   - Erstellt für den aktuellen Benutzer (`$SUDO_USER`) das Wrapper-Skript `~/.local/bin/steam-frame`:
     ```bash
     #!/usr/bin/env bash
+    export PIPEWIRE_LATENCY="512/48000"
+    export QT_QPA_PLATFORM="xcb"
     exec steam -pipewire -vrlinkforceenable "$@"
     ```
+    (Setzt PipeWire-Quantumpuffer auf 10.66 ms gegen Audio-Knacken/Desync und erzwingt das stabile `xcb`-Backend für SteamVR).
   - Erstellt den Desktop-Eintrag `~/.local/share/applications/steam-frame.desktop` ("Steam (Frame / VRLink)").
   - Warnung bei Flatpak-Steam: Es wird dringend die native Steam-Installation aus den CachyOS/Arch-Repos empfohlen.
 
@@ -173,22 +205,55 @@ Die folgenden Schritte müssen vom Nutzer manuell in der Benutzeroberfläche bzw
 ================================================================================
                     MANUELLE CHECKLISTE (Nicht automatisierbar)
 ================================================================================
- 1. BETA-KANAL AKTIVIEREN:
-    - Steam-Client: Einstellungen -> Schnittstelle -> Beta-Teilnahme -> 'Steam Beta Update'
+ 1. BETA-KANAL & OPENXR-LAUFZEIT:
     - SteamVR: Bibliothek -> Rechtsklick auf SteamVR -> Eigenschaften -> Betas -> 'beta - SteamVR Beta Update'
+    - Steam-Client: Einstellungen -> Schnittstelle -> Beta-Teilnahme -> 'Steam Beta Update'
+      (Tipp aus Steam-Guide: Falls die Steam-Client-Beta instabil ist, Client auf 'Standard/Stable' belassen und nur SteamVR auf 'Beta'!)
     - Headset-OS: In den Systemeinstellungen des Headsets den Beta-Kanal aktivieren.
+    - OpenXR-Laufzeitumgebung: In den SteamVR-Einstellungen -> OpenXR -> 'SteamVR als aktive OpenXR-Laufzeitumgebung verwalten'
+      (Wichtig: Verhindert, dass Titel wie VRChat im 2D-Flachbildmodus oder mit Xbox-Controller-Belegung starten).
 
- 2. STARTREIHENFOLGE BEACHTEN:
+ 2. DESKTOP-AUTO-CONNECT (KDE Plasma / GNOME):
+    - In den Netzwerkeinstellungen der Desktop-Umgebung prüfen, dass der Dongle sich NICHT automatisch mit dem Heim-WLAN verbindet.
+      (KDE Plasma versucht sonst, bekannte Netzwerke über den Dongle zu verbinden und blockiert den P2P-Link für SteamVR).
+
+ 3. STARTREIHENFOLGE & HEADSET-BEDIENUNG:
     - Zuerst Steam über 'steam-frame' (bzw. den Desktop-Eintrag 'Steam (Frame / VRLink)') starten.
     - SteamVR am Desktop starten.
-    - Erst DANACH das Headset einschalten (der Dongle stellt eine direkte P2P-Verbindung her).
+    - Erst DANACH das Headset einschalten.
+    - Am Headset: Einstellungen -> Remote Play -> ganz nach unten zu 'Wireless Streaming Adapter' scrollen.
+      Prüfen, ob der Adapter gekoppelt ist, und auf den Desktop klicken zum 'Pairen'.
+    - Status-Icon in der Menüleiste am Headset prüfen:
+      * GRÜN  = Nur Heim-WLAN verbunden.
+      * LILA  = Multilink aktiv (Dongle und WLAN sind gleichzeitig verbunden - optimal!).
+    - Streaming-Status am Headset: Host auswählen -> 'Erweitert' -> 'Stream VR Without Game' wählen!
+      (Erst wenn SteamVR auf dem Headset läuft, das gewünschte VR-Spiel starten).
 
- 3. BEI INSTABILITÄT / RUCKLERN:
-    - SteamRT3 (Steam Linux Runtime 3.0) deaktivieren, falls Abstürze auftreten.
+ 4. BEI INSTABILITÄT, ABSTÜRZEN & VERBINDUNGSPROBLEMEN:
+    - Hängende Prozesse beenden: Nach Abstürzen verbleiben oft 'vrserver' oder 'vrcompositor' im Hintergrund und blockieren
+      Folgeverbindungen. Beenden mit: steamframe-setup reset-steam (oder: pkill -9 -f "steam|steamvr|vrserver")
+    - Multilink-Option: In den SteamVR-Einstellungen (Erweitert aktivieren) -> Steam Link -> 'Allow Multiple Links'
+      testweise umschalten, falls die Verbindung abbricht.
+    - NetworkManager iwd-Backend: Falls mit wpa_supplicant kein P2P-Handshake zustande kommt,
+      in /etc/NetworkManager/conf.d/ das iwd-Backend aktivieren ('wifi.backend=iwd', Paket: networkmanager-iwd).
+    - SteamRT3 (Steam Linux Runtime 3.0): In SteamVR-Eigenschaften deaktivieren, falls Abstürze beim Streamstart auftreten.
     - NetworkManager BSSID-Pinning: Sobald das Headset gekoppelt ist, die Headset-BSSID fest
-      im NM-Verbindungsprofil hinterlegen:
-      nmcli connection modify "<SSID>" 802-11-wireless.bssid "<HEADSET_MAC>"
-      Dies stoppt periodische Roaming-Hintergrundscans in NetworkManager vollständig.
+      im NM-Verbindungsprofil hinterlegen (nmcli connection modify <SSID> 802-11-wireless.bssid <BSSID>),
+      um periodische Roaming-Hintergrundscans vollständig zu eliminieren.
+
+ 5. HARDWARE & USB-ANBINDUNG:
+    - Dongle direkt an einen USB 3.0/3.2 Port am I/O-Panel der Mainboard-Rückseite anschließen.
+    - Idealerweise ein 0.5–1m langes USB 3.0 Verlängerungskabel nutzen, um Abstand zu internen
+      Mainboard-Antennen und 2.4/5 GHz Rauschen zu halten.
+    - Falls Kernel-Bootparameter editierbar (GRUB / systemd-boot):
+      'usbcore.quirks=28de:2432:k' deaktiviert USB 3.0 Link Power Management (LPM / U1/U2)
+      für den Dongle vollständig und verhindert 50-100ms Micro-Stutters.
+
+ 6. HYBRID-GRAFIK & VULKAN-ENCODER (Laptops / APUs):
+    - Bei Laptops mit iGPU + dGPU (NVIDIA/AMD) Steam mit DRI_PRIME=1 bzw. 'prime-run steam-frame' starten
+      (verhindert PipeWire-Abstürze durch falsche DRI-Node-Zuordnung, Upstream-Bug #915).
+    - SteamVR-Auflösung auf 'Auto' belassen (keine krummen Custom-Prozentwerte, Bug #965)
+      und SteamVR Home deaktivieren, um 2 GB VRAM für den Vulkan-Video-Encoder zu reservieren.
 ================================================================================
 ```
 
@@ -199,14 +264,14 @@ Die folgenden Schritte müssen vom Nutzer manuell in der Benutzeroberfläche bzw
 ### Was verifiziert werden muss
 1. **VRLink-Streaming-Ports 10400/10401 (UDP):**
    Diese Ports stammen aus Community-Messungen/Recherchen und sind von Valve noch nicht offiziell in der Dokumentation aufgeführt. Sie sind oben in `steamframe-setup` im Array `VRLINK_PORTS` als Konstanten definiert und können bei Bedarf angepasst werden.
-2. **Self-Managed PHYs:**
-   Manche Realtek-Module oder interne Wi-Fi-Karten nutzen Firmware-seitig festgelegte Frequenzbänder (`phy#X (self-managed)`). In diesem Fall erzwingt die Firmware ihre Region unabhängig von OS-Befehlen. Sollte 6 GHz gesperrt bleiben, muss das EEPROM/NVM des Dongles beachtet werden.
+2. **Self-Managed PHYs & PASSIVE-SCAN Warnung:**
+   Manche Realtek-Module oder interne Wi-Fi-Karten nutzen Firmware-seitig festgelegte Frequenzbänder (`phy#X (self-managed)`). In Valves Troubleshoot-Skript (`frame-dongle-troubleshoot.sh`) existiert zudem eine Warnung, wenn in `global` kein `PASSIVE-SCAN` steht; auf `phy#0` ist `PASSIVE-SCAN` bei gesetztem `DE` aktiv und unbedenklich.
 3. **Dongle-Hotplug ohne vorheriges Einstecken:**
-   Wird `steamframe-setup apply` ohne eingesteckten Dongle ausgeführt, werden alle interface-unabhängigen Schritte (Regdom, Fallbacks, Steam-Launcher, NM-Konfiguration für `driver:rtw89*`) erfolgreich angewendet. Nach dem Einstecken des Dongles kann `sudo ./steamframe-setup apply` erneut aufgerufen werden, um die Interface-gebundenen UFW-Regeln zu finalisieren.
+   Wird `steamframe-setup apply` ohne eingesteckten Dongle ausgeführt, werden alle interface-unabhängigen Schritte (Regdom, Fallbacks, Steam-Launcher, NM-Konfiguration, USB-Udev-Regel, Sysctl, Polkit) erfolgreich angewendet. Nach dem Einstecken des Dongles kann `sudo ./steamframe-setup apply` erneut aufgerufen werden, um die Interface-gebundenen UFW-Regeln zu finalisieren.
 
 ### Testsuite
 Die integrierte Testsuite kann jederzeit ohne Root-Rechte ausgeführt werden:
 ```bash
 python3 -m unittest discover tests
 ```
-Alle 20 Unit-Tests decken Dongle-Erkennung, Firewall-Scoping, Regdom-Fallbacks, Latenz/Powersave, Steam-Launcher sowie die bitgenaue Manifest- und Undo-Wiederherstellung vollständig ab.
+Alle 23 Unit-Tests decken Dongle-Erkennung, Firewall-Scoping, Regdom-Fallbacks, Latenz/Powersave, System-Tuning (USB/Sysctl/Polkit/Ananicy), Valve Holo Toggles, Steam-Launcher sowie die bitgenaue Manifest- und Undo-Wiederherstellung vollständig ab.

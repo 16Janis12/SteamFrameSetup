@@ -71,12 +71,30 @@ class TestLatencyAndSteam(unittest.TestCase):
         # Check wrapper content
         wrapper_text = wrapper_path.read_text(encoding="utf-8")
         self.assertIn("steam -pipewire -vrlinkforceenable", wrapper_text)
+        self.assertIn('PIPEWIRE_LATENCY="512/48000"', wrapper_text)
+        self.assertIn('QT_QPA_PLATFORM="xcb"', wrapper_text)
         self.assertTrue(bool(wrapper_path.stat().st_mode & 0o111), "Wrapper must be executable")
 
         # Check desktop file content
         desktop_text = desktop_path.read_text(encoding="utf-8")
         self.assertIn("Name=Steam (Frame / VRLink)", desktop_text)
         self.assertIn("steam-frame", desktop_text)
+
+    def test_reset_steam(self):
+        """Tests reset_steam terminates lingering processes."""
+        engine = sf.SetupEngine(self.executor)
+        # Mock pgrep finding vrserver
+        self.executor.set_response(("pgrep", "-x", "vrserver"), returncode=0)
+        self.executor.set_response(("pgrep", "-x", "steam"), returncode=1)
+        self.executor.set_response(("pgrep", "-x", "steamvr"), returncode=1)
+        self.executor.set_response(("pgrep", "-x", "vrcompositor"), returncode=1)
+        self.executor.set_response(("pgrep", "-x", "vrmonitor"), returncode=1)
+        self.executor.set_response(("pgrep", "-x", "vrwebhelper"), returncode=1)
+
+        ret = engine.reset_steam()
+        self.assertEqual(ret, 0)
+        # Verify pkill was invoked for vrserver
+        self.assertIn(["pkill", "-9", "-x", "vrserver"], self.executor.executed_commands)
 
 
 if __name__ == "__main__":

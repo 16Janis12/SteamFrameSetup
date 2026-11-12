@@ -55,6 +55,259 @@ MODPROBE_CONF_REL = Path("etc/modprobe.d/steamframe-regdom.conf")
 SYSTEMD_UNIT_REL = Path("etc/systemd/system/steamframe-regdom.service")
 NM_CONF_REL = Path("etc/NetworkManager/conf.d/99-steamframe-powersave.conf")
 NM_DISPATCHER_REL = Path("etc/NetworkManager/dispatcher.d/99-steamframe.sh")
+HOLO_TOGGLE_BIN_REL = Path("usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles")
+HOLO_POLKIT_POLICY_REL = Path("usr/share/polkit-1/actions/org.valve.holo-realtek-firmware-toggles.policy")
+
+# Additional optimizations from community research & upstream Valve Linux findings
+UDEV_USB_RULE_REL = Path("etc/udev/rules.d/99-steamframe-usb-power.rules")
+MODPROBE_RTW89_REL = Path("etc/modprobe.d/steamframe-rtw89.conf")
+SYSCTL_NET_REL = Path("etc/sysctl.d/99-steamframe-network.conf")
+POLKIT_NM_REL = Path("etc/polkit-1/rules.d/99-steamframe-networkmanager.rules")
+ANANICY_VR_REL = Path("etc/ananicy.d/99-steamframe-vr.rules")
+
+# Valve Holo Realtek Firmware Toggler (embedded from Valve SteamOS / Holo)
+HOLO_TOGGLE_SCRIPT_CONTENT = """#!/bin/bash
+set -eu
+
+if [[ $EUID -ne 0 ]];
+then
+    exec pkexec --disable-internal-agent "$0" "$@"
+fi
+
+error() {
+   echo "ERROR at ${1}:${2}" >&2
+   exit 1
+}
+trap 'error "${BASH_SOURCE}" "${LINENO}"' ERR
+
+mapfile -t RTW89_DEBUGFS_DIRS < <(find /sys/kernel/debug/ieee80211 -name rtw89 -type d 2>/dev/null || true)
+
+if [[ "${#RTW89_DEBUGFS_DIRS[@]}" == "0" ]]; then
+    echo "No realtek dongles found, or driver too old!" >&2
+    exit 0
+fi
+
+declare -A BITS
+declare -A STATE
+
+function parse_disable_dm() {
+    local disable_dm_path="${1}"
+    BITS=()
+    STATE=()
+
+    while IFS= read -r line; do
+        if [[ $line =~ ^\\[([0-9]+)\\][[:space:]]+([A-Z0-9_]+):[[:space:]]+([OX])$ ]]; then
+            bit="${BASH_REMATCH[1]}"
+            name="${BASH_REMATCH[2]}"
+            val="${BASH_REMATCH[3]}"
+
+            if [[ "$val" == "X" ]]; then
+                val="1"
+            fi
+
+            BITS["$name"]="$bit"
+            STATE["$name"]="$val"
+        fi
+    done < "${disable_dm_path}"
+}
+
+function print_mask() {
+    local mask=0
+    for name in "${!BITS[@]}"; do
+        if [[ ${STATE[$name]} == "1" ]]; then
+            mask=$(( mask | ( 2 ** BITS[$name] ) ))
+        fi
+    done
+    printf "0x%x\\n" "$mask"
+}
+
+function boolify() {
+    case "$1" in
+        1|on|true|enable|enabled) echo -n "1" ;;
+        0|off|false|disable|disabled) echo -n "0" ;;
+        *) echo "Unable to convert '${1}' into a boolean!" >&2; exit 1 ;;
+    esac
+}
+
+function boolify_disable() {
+    case "$(boolify "$1")" in
+        1) echo -n "0" ;;
+        0) echo -n "1" ;;
+    esac
+}
+
+function set_feature() {
+    local name="$1"
+    local val="$2"
+    if [[ ! -v STATE[$name] ]]; then
+        echo "Unknown feature: $name" >&2
+        return 1
+    fi
+    STATE[$name]="$(boolify_disable "$val")"
+}
+
+function log2_floor() {
+    local x="${1}"
+    local count="0"
+    while [ "${x}" -gt 0 ]; do
+        count=$((count + 1))
+        x=$((x / 2))
+    done
+    echo -n "${count}"
+}
+
+function build_edca() {
+    TXOP="${1}"
+    CWMAX="${2}"
+    CWMIN="${3}"
+    AIFSN="${4}"
+    printf "%04X%1X%1X%02X\\n" "$(( ( "${TXOP}" - 1 ) / 32 + 1))" "$(log2_floor "${CWMAX}")" "$(log2_floor "${CWMIN}")" "$((16 + 9 * "${AIFSN}"))"
+}
+
+for DEBUGFS_DIR in "${RTW89_DEBUGFS_DIRS[@]}"; do
+    PHY_NAME="$(basename "$(dirname "${DEBUGFS_DIR}" )" )"
+    WLAN_NAME="$(basename "$(compgen -G "$(dirname "${DEBUGFS_DIR}" )/netdev:*" 2>/dev/null || echo "")" | cut -d: -f2-)"
+
+    if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then
+        parse_disable_dm "${DEBUGFS_DIR}/disable_dm"
+    fi
+
+    case "${1:-}" in
+        set-low-latency-mode)
+            case "$(boolify "${2:-1}")" in
+                1)
+                    "$0" set-feature HW_SCAN off || true
+                    "$0" set-amsdu off || true
+                    "$0" set-mcs-rates 0-9 || true
+                    "$0" set-powersave off || true
+                    "$0" set-pd-thresh -75 || true
+                    "$0" set-aggressive-edca on || true
+                    ;;
+                0)
+                    "$0" reset || true
+                    ;;
+            esac
+            ;;
+
+        set-amsdu)
+            if [[ -n "${WLAN_NAME}" ]]; then
+                case "$(boolify "${2:-0}")" in
+                    1) iw dev "${WLAN_NAME}" set tidconf tids 0xff amsdu on 2>/dev/null || true ;;
+                    0) iw dev "${WLAN_NAME}" set tidconf tids 0xff amsdu off 2>/dev/null || true ;;
+                esac
+            fi
+            ;;
+
+        set-mcs-rates)
+            MCS_RATES="${2:-}"
+            if [[ -n "${WLAN_NAME}" ]]; then
+                if [[ -z "${MCS_RATES}" ]]; then
+                    iw dev "${WLAN_NAME}" set bitrates 2>/dev/null || true
+                else
+                    IW_ARGS=()
+                    for BAND in 5 6; do
+                        IW_ARGS+=( "he-mcs-${BAND}" )
+                        for SPATIAL_STREAM in 1 2; do
+                            IW_ARGS+=( "${SPATIAL_STREAM}:${MCS_RATES}" )
+                        done
+                    done
+                    iw dev "${WLAN_NAME}" set bitrates "${IW_ARGS[@]}" 2>/dev/null || true
+                fi
+            fi
+            ;;
+
+        set-powersave)
+            if [[ -n "${WLAN_NAME}" ]]; then
+                case "$(boolify "${2:-0}")" in
+                    1)
+                        iw dev "${WLAN_NAME}" set power_save on 2>/dev/null || true
+                        set_feature "INACTIVE_PS" on || true
+                        ;;
+                    0)
+                        iw dev "${WLAN_NAME}" set power_save off 2>/dev/null || true
+                        set_feature "INACTIVE_PS" off || true
+                        ;;
+                esac
+            fi
+            if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then
+                print_mask > "${DEBUGFS_DIR}/disable_dm" 2>/dev/null || true
+            fi
+            ;;
+
+        set-pd-thresh)
+            if [[ -f "${DEBUGFS_DIR}/static_pd_th" ]]; then
+                if [[ "${2:-0}" == "0" ]]; then
+                    echo "0" >"${DEBUGFS_DIR}/static_pd_th" 2>/dev/null || true
+                else
+                    echo "1 ${2:--75}" >"${DEBUGFS_DIR}/static_pd_th" 2>/dev/null || true
+                fi
+            fi
+            ;;
+
+        set-aggressive-edca)
+            REGISTER_ADDRS=( c300 c304 c308 c30c )
+            case "$(boolify "${2:-1}")" in
+                1)
+                    EDCA_PARAMS="$(build_edca 2000 7 3 1)"
+                    if [[ -f "${DEBUGFS_DIR}/write_reg" ]]; then
+                        for REG_ADDR in "${REGISTER_ADDRS[@]}"; do
+                            echo "${REG_ADDR} ${EDCA_PARAMS} 4" >"${DEBUGFS_DIR}/write_reg" 2>/dev/null || true
+                        done
+                    fi
+                    ;;
+                0) ;;
+            esac
+            ;;
+
+        set-feature)
+            if [[ -n "${2:-}" ]] && [[ -n "${3:-}" ]]; then
+                set_feature "$2" "$3" || true
+                if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then
+                    print_mask > "${DEBUGFS_DIR}/disable_dm" 2>/dev/null || true
+                fi
+            fi
+            ;;
+
+        list)
+            echo "-> ${PHY_NAME} (${WLAN_NAME})"
+            if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then cat "${DEBUGFS_DIR}/disable_dm"; fi
+            if [[ -f "${DEBUGFS_DIR}/static_pd_th" ]]; then cat "${DEBUGFS_DIR}/static_pd_th" | grep -E 'DIG:|OFDM' || true; fi
+            ;;
+
+        reset)
+            if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then echo "0x00" > "${DEBUGFS_DIR}/disable_dm" 2>/dev/null || true; fi
+            "$0" set-pd-thresh 0 || true
+            "$0" set-aggressive-edca disable || true
+            "$0" set-powersave on || true
+            "$0" set-amsdu on || true
+            "$0" set-mcs-rates || true
+            ;;
+    esac
+done
+"""
+
+HOLO_POLKIT_POLICY_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+
+  <vendor>Valve Holo</vendor>
+  <vendor_url>http://www.steampowered.com</vendor_url>
+
+  <action id="org.valve.policykit.holo.pkexec.run-holo-polkit-helpers-holo-realtek-firmware-toggles">
+    <description>Run the holo realtek firmware toggler</description>
+    <icon_name>package-x-generic</icon_name>
+    <defaults>
+      <allow_any>yes</allow_any>
+      <allow_inactive>yes</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles</annotate>
+  </action>
+
+</policyconfig>
+"""
 
 # ANSI Color Codes
 class Colors:
@@ -923,10 +1176,20 @@ case "$ACTION" in
                 iw dev "$IFACE" set power_save off 2>/dev/null || true
             fi
 
+            # Valve Holo Low-Latency Toggles aktivieren (HW_SCAN aus, A-MSDU aus, EDCA aggressiv, MCS 0-9)
+            if [ -x /usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles ]; then
+                /usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles set-low-latency-mode on 2>/dev/null || true
+            fi
+
             # wpa_cli bgscan Unterdrueckung versuchen (falls erreichbar)
             if command -v wpa_cli >/dev/null 2>&1; then
                 wpa_cli -i "$IFACE" set_network 0 bgscan '""' 2>/dev/null || true
             fi
+        fi
+        ;;
+    down)
+        if [ -x /usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles ]; then
+            /usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles reset 2>/dev/null || true
         fi
         ;;
 esac
@@ -1012,6 +1275,12 @@ class SteamManager:
         wrapper_content = """#!/usr/bin/env bash
 # Steam-Frame Launcher fuer Valve Steam Frame / VRLink
 # Erzwingt PipeWire und VRLink-Treiber (Workaround fuer 32-Bit-Watchdog)
+# PipeWire-Latenz auf 512 Samples @ 48kHz (10.66ms) festlegen gegen Audio-Knacken/Desync
+export PIPEWIRE_LATENCY="512/48000"
+
+# QT Wayland Workaround: Verhindert stillen Absturz der SteamVR-Oberflaeche unter Wayland (KDE Plasma, Sway, Hyprland, etc.)
+export QT_QPA_PLATFORM="xcb"
+
 exec steam -pipewire -vrlinkforceenable "$@"
 """
         self.executor.write_file(wrapper_path, wrapper_content, mode=0o755)
@@ -1046,6 +1315,185 @@ MimeType=x-scheme-handler/steam;x-scheme-handler/steamlink;
         return actions
 
 # ==============================================================================
+# Valve Holo Firmware Toggles Manager
+# ==============================================================================
+
+class HoloFirmwareManager:
+    """Manages installation and execution of Valve's holo-realtek-firmware-toggles helper."""
+
+    def __init__(self, executor: SystemExecutor):
+        self.executor = executor
+        self.bin_path = executor.resolve_path(HOLO_TOGGLE_BIN_REL)
+        self.policy_path = executor.resolve_path(HOLO_POLKIT_POLICY_REL)
+
+    def is_installed(self) -> bool:
+        return self.bin_path.exists() and self.policy_path.exists()
+
+    def apply(
+        self,
+        manifest_mgr: ManifestManager,
+        manifest_data: Dict[str, Any],
+    ) -> List[str]:
+        actions: List[str] = []
+
+        # Check if already installed via pacman
+        res_pac = self.executor.run_cmd(["pacman", "-Q", "holo-realtek-firmware-toggles"], simulate_in_dry_run=True)
+        if res_pac.returncode == 0:
+            actions.append("Paket 'holo-realtek-firmware-toggles' ist bereits via pacman installiert.")
+        else:
+            # Check if pre-built package exists in workspace
+            installed_via_pacman = False
+            try:
+                base_dir = Path(__file__).resolve().parent
+                pkg_candidates = list(base_dir.glob("**/holo-realtek-firmware-toggles*.pkg.tar.zst"))
+            except Exception:
+                pkg_candidates = []
+
+            if pkg_candidates and self.executor.root == Path("/") and not self.executor.dry_run:
+                target_pkg = pkg_candidates[0]
+                res_install = self.executor.run_cmd(["pacman", "-U", "--needed", "--noconfirm", str(target_pkg)])
+                if res_install.success:
+                    manifest_mgr.record_installed_package("holo-realtek-firmware-toggles", manifest_data)
+                    actions.append(f"Paket '{target_pkg.name}' erfolgreich via pacman installiert.")
+                    installed_via_pacman = True
+
+            if not installed_via_pacman:
+                # Install helper script and polkit policy directly
+                manifest_mgr.record_created_file(self.bin_path, manifest_data)
+                manifest_mgr.record_created_file(self.policy_path, manifest_data)
+
+                self.executor.write_file(self.bin_path, HOLO_TOGGLE_SCRIPT_CONTENT, mode=0o755)
+                self.executor.write_file(self.policy_path, HOLO_POLKIT_POLICY_CONTENT, mode=0o644)
+                actions.append(f"Valve-Holo-Helper installiert: {self.bin_path}")
+                actions.append(f"Polkit-Berechtigungsdatei installiert: {self.policy_path}")
+
+        # If dongle is present or can run toggles, attempt set-low-latency-mode on
+        if not self.executor.dry_run and self.bin_path.exists():
+            res_toggle = self.executor.run_cmd([str(self.bin_path), "set-low-latency-mode", "on"])
+            if res_toggle.success:
+                actions.append("Valve-Holo-Low-Latency-Modus erfolgreich aktiviert (HW_SCAN aus, A-MSDU aus, EDCA aggressiv, MCS 0-9).")
+            else:
+                actions.append(f"Hinweis zu Holo-Toggles: {res_toggle.stderr.strip() or 'Wird automatisch beim Einstecken aktiviert'}")
+        elif self.executor.dry_run:
+            actions.append("[DRY-RUN] Würde Low-Latency-Modus via holo-realtek-firmware-toggles aktivieren.")
+
+        return actions
+
+    def revert(self, manifest_data: Dict[str, Any]) -> List[str]:
+        actions: List[str] = []
+        if self.bin_path.exists():
+            self.executor.run_cmd([str(self.bin_path), "reset"])
+            actions.append("Holo-Firmware-Toggles auf Werkseinstellungen zurückgesetzt ('reset').")
+        return actions
+
+# ==============================================================================
+# System Tuning Manager (USB Power, Sysctl, Polkit, Ananicy)
+# ==============================================================================
+
+class SystemTuningManager:
+    """Manages kernel, USB power, network socket buffer, and process scheduling tweaks."""
+
+    def __init__(self, executor: SystemExecutor):
+        self.executor = executor
+        self.udev_path = executor.resolve_path(UDEV_USB_RULE_REL)
+        self.modprobe_path = executor.resolve_path(MODPROBE_RTW89_REL)
+        self.sysctl_path = executor.resolve_path(SYSCTL_NET_REL)
+        self.polkit_path = executor.resolve_path(POLKIT_NM_REL)
+        self.ananicy_path = executor.resolve_path(ANANICY_VR_REL)
+
+    def apply_all(
+        self,
+        manifest_mgr: ManifestManager,
+        manifest_data: Dict[str, Any],
+    ) -> List[str]:
+        actions: List[str] = []
+
+        # 1. Udev rule for USB power (autosuspend off for Valve Dongle 28de:2432)
+        manifest_mgr.record_created_file(self.udev_path, manifest_data)
+        udev_content = (
+            f"# Erstellt von {TOOL_NAME}\n"
+            f"# Verhindert USB-Autosuspend fuer den Valve Steam Frame Dongle (28de:2432)\n"
+            f'ACTION=="add|bind", SUBSYSTEM=="usb", ATTR{{idVendor}}=="28de", ATTR{{idProduct}}=="2432", '
+            f'ATTR{{power/control}}="on", ATTR{{power/autosuspend}}="-1"\n'
+        )
+        self.executor.write_file(self.udev_path, udev_content, mode=0o644)
+        actions.append(f"Udev-Regel fuer USB-Power angelegt: {self.udev_path}")
+
+        if not self.executor.dry_run and self.executor.root == Path("/"):
+            self.executor.run_cmd(["udevadm", "control", "--reload-rules"])
+            self.executor.run_cmd(["udevadm", "trigger", "--subsystem-match=usb"])
+
+        # 2. Kernel modprobe rtw89_core PM disable
+        manifest_mgr.record_created_file(self.modprobe_path, manifest_data)
+        modprobe_content = (
+            f"# Erstellt von {TOOL_NAME}\n"
+            f"# Deaktiviert Core-Powersave im Realtek rtw89-Treiber\n"
+            f"options rtw89_core disable_ps_mode=y\n"
+        )
+        self.executor.write_file(self.modprobe_path, modprobe_content, mode=0o644)
+        actions.append(f"Modprobe-Konfiguration fuer rtw89 angelegt: {self.modprobe_path}")
+
+        # 3. Network socket buffers (sysctl)
+        manifest_mgr.record_created_file(self.sysctl_path, manifest_data)
+        sysctl_content = (
+            f"# Erstellt von {TOOL_NAME}\n"
+            f"# Erweiterte Socket-Puffer fuer unterbrechungsfreies 6-GHz-Streaming\n"
+            f"net.core.rmem_max=33554432\n"
+            f"net.core.wmem_max=33554432\n"
+            f"net.core.rmem_default=524288\n"
+            f"net.core.wmem_default=524288\n"
+            f"net.core.optmem_max=2097152\n"
+            f"-net.core.netdev_max_backlog=10000\n"
+        )
+        self.executor.write_file(self.sysctl_path, sysctl_content, mode=0o644)
+        actions.append(f"Sysctl-Netzwerkpuffer-Konfiguration angelegt: {self.sysctl_path}")
+
+        if not self.executor.dry_run and self.executor.root == Path("/"):
+            self.executor.run_cmd(["sysctl", "--system"])
+
+        # 4. Minimal Polkit rule for NetworkManager P2P pairing
+        manifest_mgr.record_created_file(self.polkit_path, manifest_data)
+        polkit_content = """// Erstellt von steamframe-setup
+// Erlaubt Steam/VRLink im lokalen Nutzerkontext das Erstellen von P2P-Verbindungen
+polkit.addRule(function(action, subject) {
+    var allowed = [
+        "org.freedesktop.NetworkManager.settings.modify.system",
+        "org.freedesktop.NetworkManager.network-control",
+        "org.freedesktop.NetworkManager.wifi.share.protected"
+    ];
+    if (allowed.indexOf(action.id) !== -1 && subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});
+"""
+        self.executor.write_file(self.polkit_path, polkit_content, mode=0o644)
+        actions.append(f"Polkit-Regel fuer NetworkManager angelegt: {self.polkit_path}")
+
+        # 5. Ananicy-cpp process scheduling rules (if ananicy directory exists)
+        ananicy_dir = self.executor.resolve_path("etc/ananicy.d")
+        if ananicy_dir.exists() or (not self.executor.dry_run and self.executor.root != Path("/")):
+            manifest_mgr.record_created_file(self.ananicy_path, manifest_data)
+            ananicy_content = """[
+  { "name": "vrcompositor", "type": "LowLatency_RT" },
+  { "name": "vrcompositor-launcher", "type": "LowLatency_RT" }
+]
+"""
+            self.executor.write_file(self.ananicy_path, ananicy_content, mode=0o644)
+            actions.append(f"Ananicy-cpp-Regel fuer vrcompositor angelegt: {self.ananicy_path}")
+            if not self.executor.dry_run and self.executor.root == Path("/"):
+                self.executor.run_cmd(["systemctl", "try-restart", "ananicy-cpp"])
+
+        return actions
+
+    def reload_subsystems_after_undo(self) -> None:
+        """Reloads udev, sysctl, and ananicy after files have been undone."""
+        if not self.executor.dry_run and self.executor.root == Path("/"):
+            self.executor.run_cmd(["udevadm", "control", "--reload-rules"])
+            self.executor.run_cmd(["udevadm", "trigger", "--subsystem-match=usb"])
+            self.executor.run_cmd(["sysctl", "--system"])
+            self.executor.run_cmd(["systemctl", "try-restart", "ananicy-cpp"])
+
+# ==============================================================================
 # Engine: Apply, Undo, Status, Check
 # ==============================================================================
 
@@ -1059,6 +1507,8 @@ class SetupEngine:
         self.firewall = FirewallManager(executor)
         self.regdom = RegdomManager(executor)
         self.latency = LatencyManager(executor)
+        self.tuning = SystemTuningManager(executor)
+        self.holo = HoloFirmwareManager(executor)
         self.steam = SteamManager(executor)
 
     def print_checklist(self) -> None:
@@ -1067,21 +1517,55 @@ class SetupEngine:
 {Colors.BOLD}{Colors.CYAN}════════════════════════════════════════════════════════════════════════════════
                      MANUELLE CHECKLISTE (Nicht automatisierbar)
 ════════════════════════════════════════════════════════════════════════════════{Colors.RESET}
- 1. {Colors.BOLD}BETA-KANAL AKTIVIEREN:{Colors.RESET}
-    - {Colors.BOLD}Steam-Client:{Colors.RESET} Einstellungen -> Schnittstelle -> Beta-Teilnahme -> 'Steam Beta Update'
+ 1. {Colors.BOLD}BETA-KANAL & OPENXR-LAUFZEIT:{Colors.RESET}
     - {Colors.BOLD}SteamVR:{Colors.RESET} Bibliothek -> Rechtsklick auf SteamVR -> Eigenschaften -> Betas -> 'beta - SteamVR Beta Update'
+    - {Colors.BOLD}Steam-Client:{Colors.RESET} Einstellungen -> Schnittstelle -> Beta-Teilnahme -> 'Steam Beta Update'
+      ({Colors.DIM}Tipp aus Steam-Guide: Falls die Steam-Client-Beta instabil ist, Client auf 'Standard/Stable' belassen und nur SteamVR auf 'Beta'!{Colors.RESET})
     - {Colors.BOLD}Headset-OS:{Colors.RESET} In den Systemeinstellungen des Headsets den Beta-Kanal aktivieren.
+    - {Colors.BOLD}OpenXR-Laufzeitumgebung:{Colors.RESET} In SteamVR-Einstellungen -> OpenXR -> 'SteamVR als aktive OpenXR-Laufzeitumgebung verwalten'
+      ({Colors.DIM}Verhindert, dass Titel wie VRChat im 2D-Flachbildmodus oder mit Xbox-Controller-Belegung starten{Colors.RESET}).
 
- 2. {Colors.BOLD}STARTREIHENFOLGE BEACHTEN:{Colors.RESET}
+ 2. {Colors.BOLD}DESKTOP-AUTO-CONNECT (KDE Plasma / GNOME):{Colors.RESET}
+    - In den Netzwerkeinstellungen der Desktop-Umgebung prüfen, dass der Dongle sich {Colors.BOLD}nicht{Colors.RESET} automatisch mit dem Heim-WLAN verbindet.
+      ({Colors.DIM}KDE Plasma versucht sonst, bekannte Netzwerke über den Dongle zu verbinden und blockiert den P2P-Link für SteamVR{Colors.RESET}).
+
+ 3. {Colors.BOLD}STARTREIHENFOLGE & HEADSET-BEDIENUNG:{Colors.RESET}
     - Zuerst Steam über '{Colors.GREEN}steam-frame{Colors.RESET}' starten (bzw. den Desktop-Eintrag 'Steam (Frame / VRLink)').
     - SteamVR am Desktop starten.
-    - {Colors.BOLD}Erst DANACH{Colors.RESET} das Headset einschalten (Punkt-zu-Punkt Direct Connect).
+    - {Colors.BOLD}Erst DANACH{Colors.RESET} das Headset einschalten.
+    - {Colors.BOLD}Am Headset:{Colors.RESET} Einstellungen -> Remote Play -> ganz nach unten zu 'Wireless Streaming Adapter' scrollen.
+      Prüfen, ob der Adapter gekoppelt ist, und auf den Desktop klicken zum 'Pairen'.
+    - {Colors.BOLD}Status-Icon in der Menüleiste am Headset prüfen:{Colors.RESET}
+      * {Colors.GREEN}GRÜN{Colors.RESET}  = Nur Heim-WLAN verbunden.
+      * {Colors.HEADER}LILA{Colors.RESET}  = Multilink aktiv (Dongle und WLAN sind gleichzeitig verbunden - optimal!).
+    - {Colors.BOLD}Streaming-Status am Headset:{Colors.RESET} Host auswählen -> 'Erweitert' -> '{Colors.BOLD}Stream VR Without Game{Colors.RESET}' wählen!
+      (Erst wenn SteamVR auf dem Headset läuft, das gewünschte VR-Spiel starten).
 
- 3. {Colors.BOLD}BEI INSTABILITÄT / RUCKLERN:{Colors.RESET}
-    - SteamRT3 (Steam Linux Runtime 3.0) deaktivieren, falls Abstürze auftreten.
-    - NetworkManager BSSID-Pinning: Sobald das Headset gekoppelt ist, die Headset-BSSID fest
+ 4. {Colors.BOLD}BEI INSTABILITÄT, ABSTÜRZEN & VERBINDUNGSPROBLEMEN:{Colors.RESET}
+    - {Colors.BOLD}Hängende Prozesse beenden:{Colors.RESET} Nach Abstürzen verbleiben oft 'vrserver' oder 'vrcompositor' im Hintergrund und blockieren
+      Folgeverbindungen. Beenden mit: {Colors.GREEN}steamframe-setup reset-steam{Colors.RESET} (oder: pkill -9 -f "steam|steamvr|vrserver")
+    - {Colors.BOLD}Multilink-Option:{Colors.RESET} In SteamVR-Einstellungen (Erweitert aktivieren) -> Steam Link -> 'Allow Multiple Links'
+      testweise umschalten, falls die Verbindung abbricht.
+    - {Colors.BOLD}NetworkManager iwd-Backend:{Colors.RESET} Falls mit wpa_supplicant kein P2P-Handshake zustande kommt,
+      in /etc/NetworkManager/conf.d/ das iwd-Backend aktivieren ('wifi.backend=iwd', Paket: networkmanager-iwd).
+    - {Colors.BOLD}SteamRT3 (Steam Linux Runtime 3.0):{Colors.RESET} In SteamVR-Eigenschaften deaktivieren, falls Abstürze beim Streamstart auftreten.
+    - {Colors.BOLD}NetworkManager BSSID-Pinning:{Colors.RESET} Sobald das Headset gekoppelt ist, die Headset-BSSID fest
       im NM-Verbindungsprofil hinterlegen ({Colors.DIM}nmcli connection modify <SSID> 802-11-wireless.bssid <BSSID>{Colors.RESET}),
       um periodische Roaming-Hintergrundscans vollständig zu eliminieren.
+
+ 5. {Colors.BOLD}HARDWARE & USB-ANBINDUNG:{Colors.RESET}
+    - Dongle direkt an einen USB 3.0/3.2 Port am I/O-Panel der Mainboard-Rückseite anschließen.
+    - Idealerweise ein 0.5–1m langes USB 3.0 Verlängerungskabel nutzen, um Abstand zu internen
+      Mainboard-Antennen und 2.4/5 GHz Rauschen zu halten.
+    - Falls Kernel-Bootparameter editierbar (GRUB / systemd-boot):
+      {Colors.DIM}usbcore.quirks=28de:2432:k{Colors.RESET} deaktiviert USB 3.0 Link Power Management (LPM / U1/U2)
+      für den Dongle vollständig und verhindert 50-100ms Micro-Stutters.
+
+ 6. {Colors.BOLD}HYBRID-GRAFIK & VULKAN-ENCODER (Laptops / APUs):{Colors.RESET}
+    - Bei Laptops mit iGPU + dGPU (NVIDIA/AMD) Steam mit DRI_PRIME=1 bzw. 'prime-run steam-frame' starten
+      (verhindert PipeWire-Abstürze durch falsche DRI-Node-Zuordnung, Upstream-Bug #915).
+    - SteamVR-Auflösung auf 'Auto' belassen (keine krummen Custom-Prozentwerte, Bug #965)
+      und SteamVR Home deaktivieren, um 2 GB VRAM für den Vulkan-Video-Encoder zu reservieren.
 {Colors.BOLD}{Colors.CYAN}════════════════════════════════════════════════════════════════════════════════{Colors.RESET}
 """
         print(box)
@@ -1109,6 +1593,18 @@ class SetupEngine:
         if res_udev.returncode != 0:
             print(Colors.colorize("HINWEIS: Paket 'game-devices-udev' ist nicht installiert. (Unter CachyOS für VR-Controller-udev-Rechte empfohlen).", Colors.YELLOW))
 
+        # 4. NetworkManager service check
+        res_nm = self.executor.run_cmd(["systemctl", "is-active", "NetworkManager"], simulate_in_dry_run=True)
+        if res_nm.returncode != 0 or res_nm.stdout.strip() != "active":
+            status_str = res_nm.stdout.strip() or "inaktiv / nicht installiert"
+            print(Colors.colorize(
+                f"HINWEIS / WARNUNG: NetworkManager-Dienststatus ist '{status_str}'.\n"
+                "SteamVR und der Steam Frame Dongle setzen NetworkManager zwingend voraus,\n"
+                "um die P2P-Verbindung zum Headset aufzubauen (reines systemd-networkd reicht nicht aus).\n"
+                "Falls nötig, aktivieren Sie NetworkManager mit: sudo systemctl enable --now NetworkManager",
+                Colors.YELLOW,
+            ))
+
     def apply(self, args: argparse.Namespace) -> int:
         """Executes the full apply workflow."""
         self.pre_checks()
@@ -1135,7 +1631,9 @@ class SetupEngine:
         print(f"  • Regulatorische Domäne: '{country}' (persistent & laufend, Fallbacks für cfg80211)")
         print(f"  • Firewall: UFW VRLink-Ports (Scope: {args.ufw_scope})")
         print("  • Latenz & Powersave: NM-Powersave aus, NM-Dispatcher für Scan-Unterdrückung")
-        print("  • Steam-Launcher: Wrapper (~/.local/bin/steam-frame) und Desktop-Datei")
+        print("  • USB- & Kernel-Tuning: USB-Autosuspend aus (28de:2432), rtw89 Core-PS aus, 32MB Socket-Puffer, Polkit NM-Rechte")
+        print("  • Valve Holo Toggles: Low-Latency-Treiberoptimierungen (HW_SCAN aus, A-MSDU aus, EDCA aggressiv) & Polkit-Rechte")
+        print("  • Steam-Launcher: Wrapper (~/.local/bin/steam-frame mit PipeWire-Latenzfix) und Desktop-Datei")
 
         if not args.yes and not self.executor.dry_run:
             try:
@@ -1171,13 +1669,13 @@ class SetupEngine:
         )
 
         # Step 3: Regdom
-        print(Colors.colorize("\n[1/4] Konfiguriere Regulatorische Domäne...", Colors.BLUE))
+        print(Colors.colorize("\n[1/6] Konfiguriere Regulatorische Domäne...", Colors.BLUE))
         reg_actions = self.regdom.apply_regdom(country, self.manifest_mgr, manifest_data)
         for act in reg_actions:
             print(f"  ✓ {act}")
 
         # Step 4: Firewall
-        print(Colors.colorize("\n[2/4] Konfiguriere Firewall (UFW)...", Colors.BLUE))
+        print(Colors.colorize("\n[2/6] Konfiguriere Firewall (UFW)...", Colors.BLUE))
         fw_actions = self.firewall.apply_rules(args.ufw_scope, iface_name, self.manifest_mgr, manifest_data)
         for act in fw_actions:
             print(f"  ✓ {act}")
@@ -1185,13 +1683,25 @@ class SetupEngine:
             print("  (Keine neuen UFW-Regeln erforderlich oder UFW inaktiv)")
 
         # Step 5: Latency & Powersave
-        print(Colors.colorize("\n[3/4] Optimiere Latenz & Powersave...", Colors.BLUE))
+        print(Colors.colorize("\n[3/6] Optimiere Latenz & Powersave...", Colors.BLUE))
         lat_actions = self.latency.apply_latency_tweaks(iface_name, self.manifest_mgr, manifest_data)
         for act in lat_actions:
             print(f"  ✓ {act}")
 
-        # Step 6: Steam Launcher
-        print(Colors.colorize("\n[4/4] Erstelle Steam-Launcher...", Colors.BLUE))
+        # Step 6: System Tuning (USB power, rtw89 core PS, sysctl socket buffers, polkit, ananicy)
+        print(Colors.colorize("\n[4/6] Optimiere USB-Power, Netzwerk-Socket-Puffer & Polkit...", Colors.BLUE))
+        tune_actions = self.tuning.apply_all(self.manifest_mgr, manifest_data)
+        for act in tune_actions:
+            print(f"  ✓ {act}")
+
+        # Step 7: Valve Holo Low-Latency Toggles
+        print(Colors.colorize("\n[5/6] Installiere Valve Holo Realtek Low-Latency Toggles & Polkit...", Colors.BLUE))
+        holo_actions = self.holo.apply(self.manifest_mgr, manifest_data)
+        for act in holo_actions:
+            print(f"  ✓ {act}")
+
+        # Step 8: Steam Launcher
+        print(Colors.colorize("\n[6/6] Erstelle Steam-Launcher...", Colors.BLUE))
         steam_actions = self.steam.apply_steam_wrapper(self.manifest_mgr, manifest_data)
         for act in steam_actions:
             print(f"  ✓ {act}")
@@ -1242,6 +1752,11 @@ class SetupEngine:
             except (KeyboardInterrupt, EOFError):
                 sys.exit(1)
 
+        # 0. Revert Holo low-latency settings
+        holo_reverted = self.holo.revert(manifest_data)
+        for hr in holo_reverted:
+            print(f"  ✓ {hr}")
+
         # 1. Revert UFW rules
         print(Colors.colorize("\n[1/5] Setze UFW-Regeln zurück...", Colors.BLUE))
         fw_reverted = self.firewall.revert_rules(manifest_data)
@@ -1288,6 +1803,9 @@ class SetupEngine:
         if not self.executor.dry_run and self.executor.root == Path("/"):
             self.executor.run_cmd(["nmcli", "general", "reload", "conf"])
             print("  ✓ NetworkManager-Konfiguration neu geladen")
+
+        # Reload udev, sysctl, and ananicy after files were deleted
+        self.tuning.reload_subsystems_after_undo()
 
         # 5. Handle installed packages
         print(Colors.colorize("\n[5/5] Behandle installierte Pakete...", Colors.BLUE))
@@ -1405,13 +1923,35 @@ class SetupEngine:
                 items.append(CheckItem("Firewall", "VRLink-Portfreigaben", "UNAPPLIED", f"Fehlende Ports: {', '.join(missing_ports)}"))
 
         # 5. NetworkManager & Latency
+        res_nm = self.executor.run_cmd(["systemctl", "is-active", "NetworkManager"], simulate_in_dry_run=True)
+        nm_active = (res_nm.returncode == 0 and res_nm.stdout.strip() == "active")
+        items.append(CheckItem(
+            "Latenz",
+            "NetworkManager-Dienst",
+            "OK" if nm_active else "WARN",
+            "Aktiv (erforderlich für P2P-Link)" if nm_active else f"Inaktiv ({res_nm.stdout.strip() or 'nicht gestartet'})",
+        ))
+
         nm_conf = self.executor.resolve_path(NM_CONF_REL)
         items.append(CheckItem("Latenz", "NM-Powersave-Konfiguration", "OK" if nm_conf.exists() else "UNAPPLIED", "Vorhanden" if nm_conf.exists() else "Nicht vorhanden"))
 
         dispatcher = self.executor.resolve_path(NM_DISPATCHER_REL)
         items.append(CheckItem("Latenz", "NM-Dispatcher-Skript", "OK" if dispatcher.exists() else "UNAPPLIED", "Vorhanden" if dispatcher.exists() else "Nicht vorhanden"))
 
-        # 6. Steam Launcher
+        # 6. System Tuning (USB & Kernel)
+        items.append(CheckItem("Tuning", "USB-Autosuspend-Regel", "OK" if self.tuning.udev_path.exists() else "UNAPPLIED", "Vorhanden (28de:2432)" if self.tuning.udev_path.exists() else "Nicht vorhanden"))
+        items.append(CheckItem("Tuning", "rtw89 Core-Powersave", "OK" if self.tuning.modprobe_path.exists() else "UNAPPLIED", "Deaktiviert (disable_ps_mode=y)" if self.tuning.modprobe_path.exists() else "Standard"))
+        items.append(CheckItem("Tuning", "Sysctl-Netzwerkpuffer", "OK" if self.tuning.sysctl_path.exists() else "UNAPPLIED", "32MB Decke aktiv" if self.tuning.sysctl_path.exists() else "Standard"))
+        items.append(CheckItem("Tuning", "Polkit NM-Regel", "OK" if self.tuning.polkit_path.exists() else "UNAPPLIED", "Vorhanden (P2P-Rechte)" if self.tuning.polkit_path.exists() else "Nicht vorhanden"))
+        if self.tuning.ananicy_path.exists():
+            items.append(CheckItem("Tuning", "Ananicy vrcompositor", "OK", "LowLatency_RT aktiv"))
+
+        # 7. Valve Holo Firmware Toggles
+        holo_inst = self.holo.is_installed()
+        items.append(CheckItem("Holo-Treiber", "Valve Firmware-Toggles", "OK" if holo_inst else "UNAPPLIED", "Installiert (/usr/bin/holo-polkit-helpers/...)" if holo_inst else "Nicht installiert"))
+        items.append(CheckItem("Holo-Treiber", "Polkit-Berechtigung", "OK" if self.holo.policy_path.exists() else "UNAPPLIED", "Vorhanden (passwortfreies Umschalten)" if self.holo.policy_path.exists() else "Nicht vorhanden"))
+
+        # 8. Steam Launcher
         has_native, has_flatpak = self.steam.check_steam_environment()
         if has_native:
             items.append(CheckItem("Steam", "Installationstyp", "OK", "Natives Steam (/usr/bin/steam)"))
@@ -1426,7 +1966,7 @@ class SetupEngine:
         items.append(CheckItem("Steam", "Wrapper-Skript", "OK" if wrapper.exists() else "UNAPPLIED", str(wrapper) if wrapper.exists() else "Nicht vorhanden"))
         items.append(CheckItem("Steam", "Desktop-Eintrag", "OK" if desktop.exists() else "UNAPPLIED", str(desktop) if desktop.exists() else "Nicht vorhanden"))
 
-        # 7. Manifest
+        # 8. Manifest
         manifest = self.manifest_mgr.load_manifest()
         if manifest:
             items.append(CheckItem("Manifest", "Setup-Status", "OK", f"Angewendet am {manifest.get('created_at', '?')}"))
@@ -1454,6 +1994,24 @@ class SetupEngine:
 
             print(f"  {tag} {item.name:<28} : {item.message}")
         print()
+        return 0
+
+    def reset_steam(self) -> int:
+        """Kills all running and lingering Steam, SteamVR, and compositor processes."""
+        print(Colors.colorize("\n=== Beende alle laufenden Steam- und SteamVR-Prozesse ===", Colors.BOLD))
+        targets = ["steam", "steamvr", "vrserver", "vrcompositor", "vrmonitor", "vrwebhelper"]
+        killed = []
+        for proc in targets:
+            res_pgrep = self.executor.run_cmd(["pgrep", "-x", proc], simulate_in_dry_run=True)
+            if res_pgrep.returncode == 0:
+                self.executor.run_cmd(["pkill", "-9", "-x", proc])
+                killed.append(proc)
+
+        if killed:
+            print(Colors.colorize(f"  ✓ Folgende Prozesse wurden beendet: {', '.join(killed)}", Colors.GREEN))
+        else:
+            print("  (Keine aktiven Steam- oder SteamVR-Prozesse gefunden)")
+        print(Colors.colorize("Bereinigung abgeschlossen. Steam kann nun sauber neu gestartet werden.\n", Colors.BOLD))
         return 0
 
 # ==============================================================================
@@ -1539,6 +2097,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Alias für 'status' mit detaillierter Validierung.",
     )
 
+    # reset-steam
+    subparsers.add_parser(
+        "reset-steam",
+        parents=[common_parser],
+        help="Beendet alle hängenden Steam- und SteamVR-Prozesse (vrserver, vrcompositor, steam).",
+    )
+
     return parser
 
 def main() -> int:
@@ -1557,6 +2122,8 @@ def main() -> int:
         return engine.undo(args)
     elif args.command in ("status", "check"):
         return engine.status(args)
+    elif args.command == "reset-steam":
+        return engine.reset_steam()
     else:
         parser.print_help()
         return 1
