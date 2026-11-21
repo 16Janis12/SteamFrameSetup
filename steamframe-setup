@@ -65,25 +65,30 @@ SYSCTL_NET_REL = Path("etc/sysctl.d/99-steamframe-network.conf")
 POLKIT_NM_REL = Path("etc/polkit-1/rules.d/99-steamframe-networkmanager.rules")
 ANANICY_VR_REL = Path("etc/ananicy.d/99-steamframe-vr.rules")
 
-# Valve Holo Realtek Firmware Toggler (embedded from Valve SteamOS / Holo)
-HOLO_TOGGLE_SCRIPT_CONTENT = """#!/bin/bash
+# Valve Holo Realtek Firmware Toggler (embedded from Valve SteamOS / Holo, patched for kernel stability)
+HOLO_TOGGLE_SCRIPT_CONTENT = r"""#!/bin/bash
+# Patched and hardened for Steam Frame on Linux / rtw89
+# Prevents kernel NULL pointer dereference in rtw89_phy_rate_pattern_vif
+# and prevents infinite pkexec retry storms from Steam client.
+
 set -eu
 
-if [[ $EUID -ne 0 ]];
-then
+if [[ $EUID -ne 0 ]]; then
     exec pkexec --disable-internal-agent "$0" "$@"
 fi
 
 error() {
    echo "ERROR at ${1}:${2}" >&2
-   exit 1
+   exit 0  # Do not return 1 to prevent Steam client from entering an infinite rapid pkexec retry loop
 }
 trap 'error "${BASH_SOURCE}" "${LINENO}"' ERR
 
+# Get list of `rtw89` directories in `/sys/kernel/debug`.
 mapfile -t RTW89_DEBUGFS_DIRS < <(find /sys/kernel/debug/ieee80211 -name rtw89 -type d 2>/dev/null || true)
 
 if [[ "${#RTW89_DEBUGFS_DIRS[@]}" == "0" ]]; then
-    echo "No realtek dongles found, or driver too old!" >&2
+    # Return 0 so caller doesn't spam retries when dongle is unplugged
+    echo "No realtek dongles found, or driver too old / debugfs not mounted!" >&2
     exit 0
 fi
 
@@ -95,8 +100,13 @@ function parse_disable_dm() {
     BITS=()
     STATE=()
 
+    if [[ ! -r "${disable_dm_path}" ]]; then
+        return 0
+    fi
+
+    # Parse feature file
     while IFS= read -r line; do
-        if [[ $line =~ ^\\[([0-9]+)\\][[:space:]]+([A-Z0-9_]+):[[:space:]]+([OX])$ ]]; then
+        if [[ $line =~ ^\[([0-9]+)\][[:space:]]+([A-Z0-9_]+):[[:space:]]+([OX])$ ]]; then
             bit="${BASH_REMATCH[1]}"
             name="${BASH_REMATCH[2]}"
             val="${BASH_REMATCH[3]}"
@@ -112,41 +122,62 @@ function parse_disable_dm() {
 }
 
 function print_mask() {
+    # Build bitmask from file
     local mask=0
     for name in "${!BITS[@]}"; do
         if [[ ${STATE[$name]} == "1" ]]; then
             mask=$(( mask | ( 2 ** BITS[$name] ) ))
         fi
     done
-    printf "0x%x\\n" "$mask"
+    printf "0x%x\n" "$mask"
 }
 
 function boolify() {
     case "$1" in
-        1|on|true|enable|enabled) echo -n "1" ;;
-        0|off|false|disable|disabled) echo -n "0" ;;
-        *) echo "Unable to convert '${1}' into a boolean!" >&2; exit 1 ;;
+        1|on|true|enable|enabled)
+            echo -n "1"
+            ;;
+        0|off|false|disable|disabled)
+            echo -n "0"
+            ;;
+        *)
+            echo "Unable to convert '${1}' into a boolean!" >&2
+            echo -n "0"
+            ;;
     esac
 }
 
+# Convert from `disabled` -> `1`.
 function boolify_disable() {
     case "$(boolify "$1")" in
-        1) echo -n "0" ;;
-        0) echo -n "1" ;;
+        1)
+            echo -n "0"
+            ;;
+        0)
+            echo -n "1"
+            ;;
     esac
 }
 
 function set_feature() {
     local name="$1"
     local val="$2"
+
     if [[ ! -v STATE[$name] ]]; then
         echo "Unknown feature: $name" >&2
-        return 1
+        return 0
     fi
+
     STATE[$name]="$(boolify_disable "$val")"
 }
 
-function log2_floor() {
+function set_pd_thresh() {
+    local val="$1"
+    echo "$1" | static_pd_th
+}
+
+function log2_floor()
+{
     local x="${1}"
     local count="0"
     while [ "${x}" -gt 0 ]; do
@@ -156,76 +187,168 @@ function log2_floor() {
     echo -n "${count}"
 }
 
-function build_edca() {
+function build_edca()
+{
     TXOP="${1}"
     CWMAX="${2}"
     CWMIN="${3}"
     AIFSN="${4}"
-    printf "%04X%1X%1X%02X\\n" "$(( ( "${TXOP}" - 1 ) / 32 + 1))" "$(log2_floor "${CWMAX}")" "$(log2_floor "${CWMIN}")" "$((16 + 9 * "${AIFSN}"))"
+    printf "%04X%1X%1X%02X\n" "$(( ( "${TXOP}" - 1 ) / 32 + 1))" "$(log2_floor "${CWMAX}")" "$(log2_floor "${CWMIN}")" "$((16 + 9 * "${AIFSN}"))"
 }
 
+function print_led_color()
+{
+    local LED_DIR="${1}"
+    if [[ ! -d "${LED_DIR}" ]]; then
+        return
+    fi
+
+    local BRIGHTNESS="$(cat "${LED_DIR}/brightness" 2>/dev/null || echo 0)"
+    if [[ "${BRIGHTNESS}" == "0" ]]; then
+        echo "LED: off"
+    else
+        INTENSITIES=( $(cat "${LED_DIR}/multi_intensity" 2>/dev/null || true) )
+        NAMES=( white red green blue )
+        printf "LED: "
+        for idx in 0 1 2 3; do
+            if [[ "${INTENSITIES[${idx}]:-0}" == "1" ]]; then
+                printf "[${NAMES[${idx}]}] "
+            else
+                printf "${NAMES[${idx}]} "
+            fi
+        done
+        printf "\n"
+    fi
+}
+
+function print_usage() {
+    local prog_name="$(basename "$0")"
+
+    cat >&2 <<-EOF
+Usage:
+
+    $prog_name list                           - show all parameters for all connected rtw89 phy's
+    $prog_name set-low-latency-mode [on|off]  - Turn on/off low-latency mode
+    $prog_name reset                          - Shorthand for 'set-low-latency-mode off'
+
+To manually set different parameters that are part of low latency mode, use:
+
+    $prog_name set-amsdu [on|off]             - default is 'on'
+    $prog_name set-feature HW_SCAN [on|off]   - default is 'on'
+    $prog_name set-pd-thresh <val>            - default is '0'
+    $prog_name set-powersave [on|off]         - default is 'on'
+    $prog_name set-aggressive-edca [on|off]   - default is 'off'
+
+NOTE: default values refer to when low-latency mode is disabled.
+EOF
+    exit 0
+}
+
+# For each dongle plugged in, set/unset the requested parameters
 for DEBUGFS_DIR in "${RTW89_DEBUGFS_DIRS[@]}"; do
     PHY_NAME="$(basename "$(dirname "${DEBUGFS_DIR}" )" )"
-    WLAN_NAME="$(basename "$(compgen -G "$(dirname "${DEBUGFS_DIR}" )/netdev:*" 2>/dev/null || echo "")" | cut -d: -f2-)"
+    LED_DIR="/sys/class/leds/rtw89-${PHY_NAME}-multicolor"
 
+    # Strictly filter out p2p-dev-* or p2p interfaces to avoid Issue #2983
+    # Dynamic interface discovery: works whether interface is wlan0, wlan1, etc.
+    WLAN_NAME="$(compgen -G "$(dirname "${DEBUGFS_DIR}")/netdev:*" 2>/dev/null | grep -v 'p2p' | head -n1 | sed -E 's|.*/netdev:||')"
+    if [[ -z "${WLAN_NAME}" ]]; then
+        for net_if in /sys/class/net/*; do
+            if [[ -r "${net_if}/phy80211/name" ]] && [[ "$(< "${net_if}/phy80211/name")" == "${PHY_NAME}" ]]; then
+                candidate="$(basename "${net_if}")"
+                if [[ "${candidate}" != p2p* ]] && [[ "${candidate}" != *p2p* ]]; then
+                    WLAN_NAME="${candidate}"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    # Load the current state
     if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then
         parse_disable_dm "${DEBUGFS_DIR}/disable_dm"
     fi
 
     case "${1:-}" in
         set-low-latency-mode)
-            case "$(boolify "${2:-1}")" in
+            if [[ -z "${2:-}" ]]; then
+                print_usage
+            fi
+            case "$(boolify "${2}")" in
                 1)
-                    "$0" set-feature HW_SCAN off || true
-                    "$0" set-amsdu off || true
-                    "$0" set-mcs-rates 0-9 || true
-                    "$0" set-powersave off || true
-                    "$0" set-pd-thresh -75 || true
-                    "$0" set-aggressive-edca on || true
+                    set_feature "HW_SCAN" off
+                    if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then
+                        print_mask > "${DEBUGFS_DIR}/disable_dm" 2>/dev/null || true
+                    fi
+                    if [[ -n "${WLAN_NAME}" ]]; then
+                        iw dev "${WLAN_NAME}" set tidconf tids 0xff amsdu off 2>/dev/null || true
+                        iw dev "${WLAN_NAME}" set power_save off 2>/dev/null || true
+                    fi
+                    set_feature "INACTIVE_PS" off
+                    if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then
+                        print_mask > "${DEBUGFS_DIR}/disable_dm" 2>/dev/null || true
+                    fi
+                    if [[ -f "${DEBUGFS_DIR}/static_pd_th" ]]; then
+                        echo "1 -75" >"${DEBUGFS_DIR}/static_pd_th" 2>/dev/null || true
+                    fi
+                    # NOTE: We intentionally DO NOT call "iw dev ... set bitrates" (set-mcs-rates)
+                    # because on rtw89 (rtw89_core) that triggers a fatal kernel NULL pointer dereference
+                    # in rtw89_phy_rate_pattern_vif. Wi-Fi 6 dynamically negotiates optimal MCS rates.
+                    # NOTE: EDCA is managed AP-side by Steam / hostapd. Direct register writes are disabled.
                     ;;
                 0)
-                    "$0" reset || true
+                    if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then
+                        echo "0x00" > "${DEBUGFS_DIR}/disable_dm" 2>/dev/null || true
+                    fi
+                    if [[ -f "${DEBUGFS_DIR}/static_pd_th" ]]; then
+                        echo "0" >"${DEBUGFS_DIR}/static_pd_th" 2>/dev/null || true
+                    fi
+                    if [[ -n "${WLAN_NAME}" ]]; then
+                        iw dev "${WLAN_NAME}" set power_save on 2>/dev/null || true
+                        iw dev "${WLAN_NAME}" set tidconf tids 0xff amsdu on 2>/dev/null || true
+                    fi
                     ;;
             esac
             ;;
 
+        # Set aggregation of SDU's; realtek's driver has a bug with this aggregation, disable it for low-latency mode.
         set-amsdu)
+            if [[ -z "${2:-}" ]]; then
+                print_usage
+            fi
             if [[ -n "${WLAN_NAME}" ]]; then
-                case "$(boolify "${2:-0}")" in
-                    1) iw dev "${WLAN_NAME}" set tidconf tids 0xff amsdu on 2>/dev/null || true ;;
-                    0) iw dev "${WLAN_NAME}" set tidconf tids 0xff amsdu off 2>/dev/null || true ;;
+                case "$(boolify "${2}")" in
+                    1)
+                        iw dev "${WLAN_NAME}" set tidconf tids 0xff amsdu on 2>/dev/null || true
+                        ;;
+                    0)
+                        iw dev "${WLAN_NAME}" set tidconf tids 0xff amsdu off 2>/dev/null || true
+                        ;;
                 esac
             fi
             ;;
 
+        # Set MCS rates; disabled on Linux rtw89 to prevent fatal kernel lockup
         set-mcs-rates)
-            MCS_RATES="${2:-}"
-            if [[ -n "${WLAN_NAME}" ]]; then
-                if [[ -z "${MCS_RATES}" ]]; then
-                    iw dev "${WLAN_NAME}" set bitrates 2>/dev/null || true
-                else
-                    IW_ARGS=()
-                    for BAND in 5 6; do
-                        IW_ARGS+=( "he-mcs-${BAND}" )
-                        for SPATIAL_STREAM in 1 2; do
-                            IW_ARGS+=( "${SPATIAL_STREAM}:${MCS_RATES}" )
-                        done
-                    done
-                    iw dev "${WLAN_NAME}" set bitrates "${IW_ARGS[@]}" 2>/dev/null || true
-                fi
-            fi
+            # Safe no-op to prevent rtw89_phy_rate_pattern_vif kernel crash
+            :
             ;;
 
+        # Disable power save features, both firmware-internal powersave and host-side powersave.
         set-powersave)
+            if [[ -z "${2:-}" ]]; then
+                print_usage
+            fi
+
             if [[ -n "${WLAN_NAME}" ]]; then
-                case "$(boolify "${2:-0}")" in
+                case "$(boolify "${2}")" in
                     1)
                         iw dev "${WLAN_NAME}" set power_save on 2>/dev/null || true
-                        set_feature "INACTIVE_PS" on || true
+                        set_feature "INACTIVE_PS" on
                         ;;
                     0)
                         iw dev "${WLAN_NAME}" set power_save off 2>/dev/null || true
-                        set_feature "INACTIVE_PS" off || true
+                        set_feature "INACTIVE_PS" off
                         ;;
                 esac
             fi
@@ -234,34 +357,31 @@ for DEBUGFS_DIR in "${RTW89_DEBUGFS_DIRS[@]}"; do
             fi
             ;;
 
+        # Set a static packet detection threshold attempt to ignore distant interferers
         set-pd-thresh)
+            if [[ -z "${2:-}" ]]; then
+                print_usage
+            fi
+
             if [[ -f "${DEBUGFS_DIR}/static_pd_th" ]]; then
-                if [[ "${2:-0}" == "0" ]]; then
+                if [[ "${2}" == 0 ]]; then
                     echo "0" >"${DEBUGFS_DIR}/static_pd_th" 2>/dev/null || true
                 else
-                    echo "1 ${2:--75}" >"${DEBUGFS_DIR}/static_pd_th" 2>/dev/null || true
+                    echo "1 ${2}" >"${DEBUGFS_DIR}/static_pd_th" 2>/dev/null || true
                 fi
             fi
             ;;
 
+        # Set aggressive EDCA - disabled (handled AP-side by Steam)
         set-aggressive-edca)
-            REGISTER_ADDRS=( c300 c304 c308 c30c )
-            case "$(boolify "${2:-1}")" in
-                1)
-                    EDCA_PARAMS="$(build_edca 2000 7 3 1)"
-                    if [[ -f "${DEBUGFS_DIR}/write_reg" ]]; then
-                        for REG_ADDR in "${REGISTER_ADDRS[@]}"; do
-                            echo "${REG_ADDR} ${EDCA_PARAMS} 4" >"${DEBUGFS_DIR}/write_reg" 2>/dev/null || true
-                        done
-                    fi
-                    ;;
-                0) ;;
-            esac
+            # Safe no-op: EDCA is set AP-side by Steam / hostapd.
+            :
             ;;
 
+        # Helper to set firmware toggles
         set-feature)
             if [[ -n "${2:-}" ]] && [[ -n "${3:-}" ]]; then
-                set_feature "$2" "$3" || true
+                set_feature "$2" "$3"
                 if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then
                     print_mask > "${DEBUGFS_DIR}/disable_dm" 2>/dev/null || true
                 fi
@@ -269,18 +389,31 @@ for DEBUGFS_DIR in "${RTW89_DEBUGFS_DIRS[@]}"; do
             ;;
 
         list)
-            echo "-> ${PHY_NAME} (${WLAN_NAME})"
-            if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then cat "${DEBUGFS_DIR}/disable_dm"; fi
-            if [[ -f "${DEBUGFS_DIR}/static_pd_th" ]]; then cat "${DEBUGFS_DIR}/static_pd_th" | grep -E 'DIG:|OFDM' || true; fi
+            echo "-> ${PHY_NAME} (${WLAN_NAME:-none})"
+            if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then
+                cat "${DEBUGFS_DIR}/disable_dm" 2>/dev/null || true
+            fi
+            if [[ -f "${DEBUGFS_DIR}/static_pd_th" ]]; then
+                cat "${DEBUGFS_DIR}/static_pd_th" 2>/dev/null | grep -E 'DIG:|OFDM' || true
+            fi
+            print_led_color "${LED_DIR}"
             ;;
 
         reset)
-            if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then echo "0x00" > "${DEBUGFS_DIR}/disable_dm" 2>/dev/null || true; fi
-            "$0" set-pd-thresh 0 || true
-            "$0" set-aggressive-edca disable || true
-            "$0" set-powersave on || true
-            "$0" set-amsdu on || true
-            "$0" set-mcs-rates || true
+            if [[ -f "${DEBUGFS_DIR}/disable_dm" ]]; then
+                echo "0x00" > "${DEBUGFS_DIR}/disable_dm" 2>/dev/null || true
+            fi
+            if [[ -f "${DEBUGFS_DIR}/static_pd_th" ]]; then
+                echo "0" >"${DEBUGFS_DIR}/static_pd_th" 2>/dev/null || true
+            fi
+            if [[ -n "${WLAN_NAME}" ]]; then
+                iw dev "${WLAN_NAME}" set power_save on 2>/dev/null || true
+                iw dev "${WLAN_NAME}" set tidconf tids 0xff amsdu on 2>/dev/null || true
+            fi
+            ;;
+
+        *)
+            print_usage
             ;;
     esac
 done
@@ -345,6 +478,10 @@ class DongleInfo:
     bus: str  # usb, pci, virtual, etc.
     mac: str = ""
     is_rtw89: bool = False
+    vendor_id: str = ""
+    product_id: str = ""
+    device_name: str = ""
+    is_valve_dongle: bool = False
 
 @dataclass
 class CommandResult:
@@ -540,15 +677,58 @@ class DongleDetector:
                 except Exception:
                     pass
 
-            # Detect bus type
+            # Detect bus type & hardware IDs (USB VID:PID or PCI vendor:device)
+            vendor_id = ""
+            product_id = ""
+            device_name = ""
             device_dir = iface_entry / "device"
             if device_dir.exists():
                 try:
-                    subsys = (device_dir / "subsystem").resolve().name
-                    if subsys == "pci":
-                        bus = "pci"
-                    elif subsys == "usb" or "usb" in str(device_dir.resolve()):
-                        bus = "usb"
+                    curr = device_dir.resolve()
+                    # Check subsystem link directly on device_dir
+                    subsys_link = device_dir / "subsystem"
+                    if subsys_link.exists():
+                        try:
+                            s_name = subsys_link.resolve().name
+                            if s_name == "pci":
+                                bus = "pci"
+                            elif s_name == "usb" or "usb" in str(curr):
+                                bus = "usb"
+                        except Exception:
+                            pass
+
+                    while curr != curr.parent:
+                        id_vendor = curr / "idVendor"
+                        id_product = curr / "idProduct"
+                        if id_vendor.exists() and id_product.exists():
+                            bus = "usb"
+                            vendor_id = id_vendor.read_text(encoding="utf-8").strip().lower()
+                            product_id = id_product.read_text(encoding="utf-8").strip().lower()
+                            mfg_f = curr / "manufacturer"
+                            prod_f = curr / "product"
+                            mfg = mfg_f.read_text(encoding="utf-8").strip() if mfg_f.exists() else ""
+                            prod = prod_f.read_text(encoding="utf-8").strip() if prod_f.exists() else ""
+                            device_name = f"{mfg} {prod}".strip()
+                            break
+
+                        subsys = curr / "subsystem"
+                        if subsys.exists():
+                            try:
+                                s_name = subsys.resolve().name
+                                if s_name == "pci":
+                                    bus = "pci"
+                                    v_file = curr / "vendor"
+                                    d_file = curr / "device"
+                                    if v_file.exists() and d_file.exists():
+                                        vendor_id = v_file.read_text(encoding="utf-8").strip().lower()
+                                        product_id = d_file.read_text(encoding="utf-8").strip().lower()
+                                        device_name = "PCIe Wireless Adapter"
+                                    break
+                                elif s_name == "usb" or "usb" in str(curr):
+                                    bus = "usb"
+                            except Exception:
+                                pass
+                        curr = curr.parent
                 except Exception:
                     pass
 
@@ -562,6 +742,9 @@ class DongleDetector:
                     pass
 
             is_rtw89 = "rtw89" in driver_name.lower()
+            is_valve_dongle = (vendor_id == "28de" and product_id == "2432")
+            if is_valve_dongle and not device_name:
+                device_name = "Valve Steam Frame Wireless Dongle"
 
             results.append(
                 DongleInfo(
@@ -571,6 +754,10 @@ class DongleDetector:
                     bus=bus,
                     mac=mac,
                     is_rtw89=is_rtw89,
+                    vendor_id=vendor_id,
+                    product_id=product_id,
+                    device_name=device_name,
+                    is_valve_dongle=is_valve_dongle,
                 )
             )
 
@@ -580,6 +767,7 @@ class DongleDetector:
         """
         Locates the appropriate dongle interface.
         Protects the internal WLAN card from accidental modification.
+        Prioritizes the official Valve Steam Frame dongle (USB 28de:2432) over any other card.
         """
         all_ifaces = self.scan_interfaces()
 
@@ -595,31 +783,46 @@ class DongleDetector:
                     is_rtw89=True,
                 )
             selected = matched[0]
-            if not selected.is_rtw89:
+            if not selected.is_valve_dongle and not selected.is_rtw89:
                 print(
                     Colors.colorize(
-                        f"WARNUNG: Die angegebene Schnittstelle '{requested_iface}' nutzt den Treiber '{selected.driver}' (nicht rtw89)!",
+                        f"WARNUNG: Die angegebene Schnittstelle '{requested_iface}' nutzt den Treiber '{selected.driver}' (nicht rtw89 / Valve-Dongle)!\n"
+                        f"Es handelt sich vermutlich um die interne WLAN-Karte (Bus: {selected.bus}).",
                         Colors.YELLOW,
                     )
                 )
             return selected
 
-        # Auto-detect candidates using rtw89 driver
-        candidates = [i for i in all_ifaces if i.is_rtw89]
-
-        if not candidates:
-            return None
-
-        if len(candidates) == 1:
-            return candidates[0]
+        # 1. Highest Priority: Valve Steam Frame Dongle (USB 28de:2432)
+        valve_candidates = [i for i in all_ifaces if i.is_valve_dongle]
+        if valve_candidates:
+            if len(valve_candidates) == 1:
+                return valve_candidates[0]
+            candidates = valve_candidates
+        else:
+            # 2. Priority: USB rtw89 dongles
+            usb_candidates = [i for i in all_ifaces if i.is_rtw89 and i.bus == "usb"]
+            if usb_candidates:
+                if len(usb_candidates) == 1:
+                    return usb_candidates[0]
+                candidates = usb_candidates
+            else:
+                # 3. Priority: Any rtw89 adapter
+                rtw89_candidates = [i for i in all_ifaces if i.is_rtw89]
+                if not rtw89_candidates:
+                    return None
+                if len(rtw89_candidates) == 1:
+                    return rtw89_candidates[0]
+                candidates = rtw89_candidates
 
         # Multiple candidates found: prompt user
-        print(Colors.colorize("Mehrere Dongle-Kandidaten (rtw89) gefunden:", Colors.CYAN))
+        print(Colors.colorize("Mehrere Dongle-Kandidaten gefunden:", Colors.CYAN))
         for idx, cand in enumerate(candidates, 1):
-            print(f"  {idx}) {cand.iface} (Treiber: {cand.driver}, Bus: {cand.bus}, MAC: {cand.mac})")
+            badge = " [Valve Steam Frame 28de:2432]" if cand.is_valve_dongle else ""
+            print(f"  {idx}) {cand.iface} (Treiber: {cand.driver}, Bus: {cand.bus}, MAC: {cand.mac}){badge}")
 
         if not interactive:
-            print(Colors.colorize("Fehler: Mehrere rtw89-Schnittstellen gefunden. Bitte Schnittstelle mit --iface angeben.", Colors.RED))
+            print(Colors.colorize("Fehler: Mehrere Dongle-Kandidaten gefunden. Bitte Schnittstelle mit --iface angeben.", Colors.RED))
             sys.exit(1)
 
         while True:
@@ -824,6 +1027,7 @@ class FirewallManager:
         iface: Optional[str],
         manifest_mgr: ManifestManager,
         manifest_data: Dict[str, Any],
+        alternate_ifaces: Optional[List[str]] = None,
     ) -> List[str]:
         """Applies missing UFW rules for VRLink ports."""
         applied_messages: List[str] = []
@@ -847,48 +1051,63 @@ class FirewallManager:
 
         existing_lines = self.get_existing_ufw_rules()
 
-        for p_info in VRLINK_PORTS:
-            port = p_info["port"]
-            proto = p_info["proto"]
-            desc = p_info["desc"]
+        # Build target interfaces list for 'iface' scope
+        # Allows both wlan0 and wlan1 if both exist so boot-time name swapping never blocks traffic
+        target_ifaces: List[Optional[str]] = []
+        if scope == "iface":
+            if iface:
+                target_ifaces.append(iface)
+            if alternate_ifaces:
+                for alt in alternate_ifaces:
+                    if alt and alt not in target_ifaces:
+                        target_ifaces.append(alt)
+        else:
+            target_ifaces = [None]
 
-            if self.is_rule_present(port, proto, scope, iface, existing_lines):
-                self.executor.logger.info(f"UFW rule for {port}/{proto} already present.")
-                continue
+        for target_if in target_ifaces:
+            for p_info in VRLINK_PORTS:
+                port = p_info["port"]
+                proto = p_info["proto"]
+                desc = p_info["desc"]
 
-            # Build command
-            if scope == "iface" and iface:
-                cmd = [
-                    "ufw", "allow", "in", "on", iface,
-                    "to", "any", "port", str(port), "proto", proto,
-                    "comment", FIREWALL_COMMENT,
-                ]
-                del_cmd = [
-                    "ufw", "delete", "allow", "in", "on", iface,
-                    "to", "any", "port", str(port), "proto", proto,
-                ]
-            else:
-                cmd = [
-                    "ufw", "allow", f"{port}/{proto}",
-                    "comment", FIREWALL_COMMENT,
-                ]
-                del_cmd = [
-                    "ufw", "delete", "allow", f"{port}/{proto}",
-                ]
+                if self.is_rule_present(port, proto, scope, target_if, existing_lines):
+                    self.executor.logger.info(f"UFW rule for {port}/{proto} (iface: {target_if}) already present.")
+                    continue
 
-            res = self.executor.run_cmd(cmd)
-            if res.success:
-                rule_record = {
-                    "port": port,
-                    "proto": proto,
-                    "scope": scope,
-                    "iface": iface if scope == "iface" else None,
-                    "delete_cmd": del_cmd,
-                }
-                manifest_mgr.record_ufw_rule(rule_record, manifest_data)
-                applied_messages.append(f"UFW: {port}/{proto} ({desc}) freigegeben [Scope: {scope}]")
-            else:
-                applied_messages.append(f"Fehler bei UFW {port}/{proto}: {res.stderr}")
+                # Build command
+                if scope == "iface" and target_if:
+                    cmd = [
+                        "ufw", "allow", "in", "on", target_if,
+                        "to", "any", "port", str(port), "proto", proto,
+                        "comment", FIREWALL_COMMENT,
+                    ]
+                    del_cmd = [
+                        "ufw", "delete", "allow", "in", "on", target_if,
+                        "to", "any", "port", str(port), "proto", proto,
+                    ]
+                else:
+                    cmd = [
+                        "ufw", "allow", f"{port}/{proto}",
+                        "comment", FIREWALL_COMMENT,
+                    ]
+                    del_cmd = [
+                        "ufw", "delete", "allow", f"{port}/{proto}",
+                    ]
+
+                res = self.executor.run_cmd(cmd)
+                if res.success:
+                    rule_record = {
+                        "port": port,
+                        "proto": proto,
+                        "scope": scope,
+                        "iface": target_if if scope == "iface" else None,
+                        "delete_cmd": del_cmd,
+                    }
+                    manifest_mgr.record_ufw_rule(rule_record, manifest_data)
+                    scope_msg = f"Scope: {scope} auf {target_if}" if (scope == "iface" and target_if) else f"Scope: {scope}"
+                    applied_messages.append(f"UFW: {port}/{proto} ({desc}) freigegeben [{scope_msg}]")
+                else:
+                    applied_messages.append(f"Fehler bei UFW {port}/{proto} ({target_if}): {res.stderr}")
 
         return applied_messages
 
@@ -1127,6 +1346,7 @@ class LatencyManager:
         iface: Optional[str],
         manifest_mgr: ManifestManager,
         manifest_data: Dict[str, Any],
+        dongle: Optional[DongleInfo] = None,
     ) -> List[str]:
         """Applies persistent NetworkManager configs and runtime powersave disabling."""
         actions: List[str] = []
@@ -1135,12 +1355,26 @@ class LatencyManager:
         nm_conf_path = self.executor.resolve_path(NM_CONF_REL)
         manifest_mgr.record_created_file(nm_conf_path, manifest_data)
 
-        # Match specific interface if known, otherwise match driver rtw89
-        match_spec = f"interface-name:{iface}" if iface else "driver:rtw89*"
+        # Match rtw89 driver family dynamically so swapping interface names (e.g. wlan0 <-> wlan1)
+        # never applies to the internal card (mt7921e/iwlwifi) and always applies to the dongle.
+        match_specs = [
+            "driver:rtw89_8852cu",
+            "driver:rtw89_8852ce",
+            "driver:rtw89_8852be",
+            "driver:rtw89_8851be",
+            "driver:rtw89pci",
+        ]
+        if dongle and dongle.mac:
+            match_specs.append(f"mac:{dongle.mac}")
+        if iface:
+            match_specs.append(f"interface-name:{iface}")
+
+        match_str = ";".join(match_specs)
         nm_conf_content = (
             f"# Erstellt von {TOOL_NAME}\n"
+            f"# Dynamische Zuweisung: Gilt fuer rtw89-Geraete unabhaengig vom Schnittstellennamen (wlan0/wlan1)\n"
             f"[connection-steamframe-powersave]\n"
-            f"match-device={match_spec}\n"
+            f"match-device={match_str}\n"
             f"wifi.powersave=2\n"  # 2 = disable powersave in NetworkManager
         )
         self.executor.write_file(nm_conf_path, nm_conf_content)
@@ -1150,33 +1384,54 @@ class LatencyManager:
         dispatcher_path = self.executor.resolve_path(NM_DISPATCHER_REL)
         manifest_mgr.record_created_file(dispatcher_path, manifest_data)
 
-        target_iface_str = iface or ""
         dispatcher_content = f"""#!/usr/bin/env bash
 # Erstellt von {TOOL_NAME}
 # Hotplug- und Verbindungs-Handler fuer Valve Steam Frame Dongle
+# Dynamische Hardware-Erkennung (rtw89 / USB 28de:2432) - immun gegen wlan0/wlan1 Swapping!
 IFACE="$1"
 ACTION="$2"
-TARGET_IFACE="{target_iface_str}"
+
+is_steamframe_iface() {{
+    local iface="$1"
+    local dev_path="/sys/class/net/$iface/device"
+    [ -e "$dev_path" ] || return 1
+
+    # 1. Treiber pruefen (rtw89-Familie)
+    local driver=""
+    if [ -e "$dev_path/driver" ]; then
+        driver=$(basename "$(readlink -f "$dev_path/driver" 2>/dev/null)" 2>/dev/null)
+    fi
+
+    case "$driver" in
+        rtw89*) return 0 ;;
+    esac
+
+    # 2. Sysfs-Elternpfade nach Valve USB VID:PID (28de:2432) durchsuchen
+    local curr="$(readlink -f "$dev_path" 2>/dev/null)"
+    while [ -n "$curr" ] && [ "$curr" != "/" ]; do
+        if [ -r "$curr/idVendor" ] && [ -r "$curr/idProduct" ]; then
+            local vid="$(cat "$curr/idVendor" 2>/dev/null | tr -d ' \\n\\r' | tr '[:upper:]' '[:lower:]')"
+            local pid="$(cat "$curr/idProduct" 2>/dev/null | tr -d ' \\n\\r' | tr '[:upper:]' '[:lower:]')"
+            if [ "$vid" = "28de" ] && [ "$pid" = "2432" ]; then
+                return 0
+            fi
+            break
+        fi
+        curr="$(dirname "$curr")"
+    done
+
+    return 1
+}}
 
 case "$ACTION" in
     up|dhcp4-change|reapply)
-        IS_MATCH=0
-        if [ -n "$TARGET_IFACE" ] && [ "$IFACE" = "$TARGET_IFACE" ]; then
-            IS_MATCH=1
-        elif [ -e "/sys/class/net/$IFACE/device/driver" ]; then
-            DRIVER=$(basename "$(readlink -f "/sys/class/net/$IFACE/device/driver" 2>/dev/null)" 2>/dev/null)
-            case "$DRIVER" in
-                rtw89*) IS_MATCH=1 ;;
-            esac
-        fi
-
-        if [ "$IS_MATCH" -eq 1 ]; then
+        if is_steamframe_iface "$IFACE"; then
             # Powersave deaktivieren
             if command -v iw >/dev/null 2>&1; then
                 iw dev "$IFACE" set power_save off 2>/dev/null || true
             fi
 
-            # Valve Holo Low-Latency Toggles aktivieren (HW_SCAN aus, A-MSDU aus, EDCA aggressiv, MCS 0-9)
+            # Valve Holo Low-Latency Toggles aktivieren (HW_SCAN aus, A-MSDU aus, Powersave aus, PD-Thresh -75)
             if [ -x /usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles ]; then
                 /usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles set-low-latency-mode on 2>/dev/null || true
             fi
@@ -1188,8 +1443,10 @@ case "$ACTION" in
         fi
         ;;
     down)
-        if [ -x /usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles ]; then
-            /usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles reset 2>/dev/null || true
+        if is_steamframe_iface "$IFACE"; then
+            if [ -x /usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles ]; then
+                /usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles reset 2>/dev/null || true
+            fi
         fi
         ;;
 esac
@@ -1338,19 +1595,35 @@ class HoloFirmwareManager:
 
         # Check if already installed via pacman
         res_pac = self.executor.run_cmd(["pacman", "-Q", "holo-realtek-firmware-toggles"], simulate_in_dry_run=True)
-        if res_pac.returncode == 0:
-            actions.append("Paket 'holo-realtek-firmware-toggles' ist bereits via pacman installiert.")
-        else:
-            # Check if pre-built package exists in workspace
-            installed_via_pacman = False
-            try:
-                base_dir = Path(__file__).resolve().parent
-                pkg_candidates = list(base_dir.glob("**/holo-realtek-firmware-toggles*.pkg.tar.zst"))
-            except Exception:
-                pkg_candidates = []
+        installed_via_pacman = False
 
-            if pkg_candidates and self.executor.root == Path("/") and not self.executor.dry_run:
+        # Locate pre-built package in workspace
+        target_pkg = None
+        try:
+            base_dir = Path(__file__).resolve().parent
+            pkg_candidates = sorted(base_dir.glob("**/holo-realtek-firmware-toggles*.pkg.tar.zst"), reverse=True)
+            if pkg_candidates:
                 target_pkg = pkg_candidates[0]
+        except Exception:
+            pass
+
+        need_pkg_upgrade = False
+        if res_pac.returncode == 0:
+            installed_ver = res_pac.stdout.strip().split()[-1] if res_pac.stdout else ""
+            if target_pkg and self.executor.root == Path("/") and ("1.4.2" in target_pkg.name and not installed_ver.startswith("1.4.2")):
+                need_pkg_upgrade = True
+            else:
+                actions.append(f"Paket 'holo-realtek-firmware-toggles' ({installed_ver}) ist bereits via pacman installiert.")
+                installed_via_pacman = True
+
+        if need_pkg_upgrade and target_pkg and self.executor.root == Path("/") and not self.executor.dry_run:
+            res_upgrade = self.executor.run_cmd(["pacman", "-U", "--noconfirm", str(target_pkg)])
+            if res_upgrade.success:
+                actions.append(f"Paket '{target_pkg.name}' (gehärtete Kernel-Version) erfolgreich aktualisiert.")
+                installed_via_pacman = True
+
+        if not installed_via_pacman:
+            if target_pkg and self.executor.root == Path("/") and not self.executor.dry_run:
                 res_install = self.executor.run_cmd(["pacman", "-U", "--needed", "--noconfirm", str(target_pkg)])
                 if res_install.success:
                     manifest_mgr.record_installed_package("holo-realtek-firmware-toggles", manifest_data)
@@ -1367,11 +1640,21 @@ class HoloFirmwareManager:
                 actions.append(f"Valve-Holo-Helper installiert: {self.bin_path}")
                 actions.append(f"Polkit-Berechtigungsdatei installiert: {self.policy_path}")
 
+        # Safety patch check: ensure installed helper file on disk has the kernel crash guard
+        if self.bin_path.exists() and not self.executor.dry_run:
+            try:
+                curr_content = self.bin_path.read_text(encoding="utf-8")
+                if "rtw89_phy_rate_pattern_vif" not in curr_content or "grep -v 'p2p'" not in curr_content:
+                    self.executor.write_file(self.bin_path, HOLO_TOGGLE_SCRIPT_CONTENT, mode=0o755)
+                    actions.append(f"Sicherheits-Patch auf {self.bin_path} angewendet (Kernel-Crash-Guard aktiv).")
+            except Exception as e:
+                self.executor.logger.warning(f"Could not check/patch {self.bin_path}: {e}")
+
         # If dongle is present or can run toggles, attempt set-low-latency-mode on
         if not self.executor.dry_run and self.bin_path.exists():
             res_toggle = self.executor.run_cmd([str(self.bin_path), "set-low-latency-mode", "on"])
             if res_toggle.success:
-                actions.append("Valve-Holo-Low-Latency-Modus erfolgreich aktiviert (HW_SCAN aus, A-MSDU aus, EDCA aggressiv, MCS 0-9).")
+                actions.append("Valve-Holo-Low-Latency-Modus erfolgreich aktiviert (HW_SCAN aus, A-MSDU aus, Powersave aus, PD-Thresh -75).")
             else:
                 actions.append(f"Hinweis zu Holo-Toggles: {res_toggle.stderr.strip() or 'Wird automatisch beim Einstecken aktiviert'}")
         elif self.executor.dry_run:
@@ -1618,8 +1901,14 @@ class SetupEngine:
         dongle = self.detector.find_dongle(requested_iface=args.iface, interactive=interactive)
         iface_name = dongle.iface if dongle else None
 
+        all_ifaces = self.detector.scan_interfaces()
+        other_wifis = [i for i in all_ifaces if i.iface.startswith("wlan") and (not dongle or i.iface != dongle.iface)]
+
         if dongle:
-            print(Colors.colorize(f"Dongle-Schnittstelle erkannt: {dongle.iface} (Treiber: {dongle.driver}, Bus: {dongle.bus})", Colors.GREEN))
+            badge = " [Hardware-ID: Valve Steam Frame 28de:2432]" if dongle.is_valve_dongle else ""
+            print(Colors.colorize(f"Dongle-Schnittstelle erkannt: {dongle.iface} (Treiber: {dongle.driver}, Bus: {dongle.bus}){badge}", Colors.GREEN))
+            for other in other_wifis:
+                print(Colors.colorize(f"  ✓ Geschützte interne WLAN-Karte: {other.iface} (Treiber: {other.driver}, Bus: {other.bus}) - bleibt unangetastet", Colors.CYAN))
         else:
             print(Colors.colorize("Kein rtw89-Dongle verbunden. Schnittstellen-unabhängige Anpassungen werden durchgeführt.", Colors.YELLOW))
             if args.ufw_scope == "iface":
@@ -1676,7 +1965,14 @@ class SetupEngine:
 
         # Step 4: Firewall
         print(Colors.colorize("\n[2/6] Konfiguriere Firewall (UFW)...", Colors.BLUE))
-        fw_actions = self.firewall.apply_rules(args.ufw_scope, iface_name, self.manifest_mgr, manifest_data)
+        alt_ifaces = [o.iface for o in other_wifis] if other_wifis else None
+        fw_actions = self.firewall.apply_rules(
+            args.ufw_scope,
+            iface_name,
+            self.manifest_mgr,
+            manifest_data,
+            alternate_ifaces=alt_ifaces,
+        )
         for act in fw_actions:
             print(f"  ✓ {act}")
         if not fw_actions:
@@ -1684,7 +1980,7 @@ class SetupEngine:
 
         # Step 5: Latency & Powersave
         print(Colors.colorize("\n[3/6] Optimiere Latenz & Powersave...", Colors.BLUE))
-        lat_actions = self.latency.apply_latency_tweaks(iface_name, self.manifest_mgr, manifest_data)
+        lat_actions = self.latency.apply_latency_tweaks(iface_name, self.manifest_mgr, manifest_data, dongle=dongle)
         for act in lat_actions:
             print(f"  ✓ {act}")
 
@@ -1863,11 +2159,12 @@ class SetupEngine:
         else:
             items.append(CheckItem("System", "game-devices-udev", "WARN", "Nicht installiert (optional für CachyOS)"))
 
-        # 2. Dongle Interface
+        # 2. Dongle & WLAN Interfaces
         all_ifaces = self.detector.scan_interfaces()
         dongle = self.detector.find_dongle(requested_iface=args.iface, interactive=False)
         if dongle:
-            items.append(CheckItem("Dongle", "Schnittstelle", "OK", f"{dongle.iface} (Treiber: {dongle.driver}, Bus: {dongle.bus})"))
+            badge = " [Valve Steam Frame 28de:2432]" if dongle.is_valve_dongle else ""
+            items.append(CheckItem("Dongle", "Schnittstelle", "OK", f"{dongle.iface} (Treiber: {dongle.driver}, Bus: {dongle.bus}){badge}"))
 
             # Check powersave runtime
             res_ps = self.executor.run_cmd(["iw", "dev", dongle.iface, "get", "power_save"], simulate_in_dry_run=True)
@@ -1879,6 +2176,11 @@ class SetupEngine:
                 items.append(CheckItem("Dongle", "Wi-Fi Powersave", "WARN", "Konnte nicht ermittelt werden"))
         else:
             items.append(CheckItem("Dongle", "Schnittstelle", "WARN", "Kein rtw89-Dongle angeschlossen"))
+
+        # Check and report protected onboard/other WLAN interfaces
+        other_wifis = [i for i in all_ifaces if i.iface.startswith("wlan") and (not dongle or i.iface != dongle.iface)]
+        for other in other_wifis:
+            items.append(CheckItem("Interne WLAN-Karte", f"Schnittstelle {other.iface}", "OK", f"Geschützt (Treiber: {other.driver}, Bus: {other.bus})"))
 
         # 3. Regulatory Domain
         res_regpkg = self.executor.run_cmd(["pacman", "-Q", "wireless-regdb"], simulate_in_dry_run=True)

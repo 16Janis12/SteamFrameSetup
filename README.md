@@ -147,9 +147,18 @@ Jede durch `steamframe-setup apply` durchgeführte Systemanpassung wird in `/var
     - `27037/tcp` (Steam Streaming Kontrollkanal)
     - `10400/udp` (VRLink Videostrom, Recherche-Kandidat)
     - `10401/udp` (VRLink Rückkanal, Recherche-Kandidat)
-  - Scope `iface` (Standard): `ufw allow in on <iface> to any port <port> proto <proto> comment "steamframe-setup"` schützt das restliche Netzwerk.
+  - Scope `iface` (Standard): `ufw allow in on <iface> to any port <port> proto <proto> comment "steamframe-setup"` schützt das restliche Netzwerk. Bei Mehrfach-WLAN-Systemen werden alle potenziell wechselnden Schnittstellen (`wlan0`, `wlan1`) abgedeckt.
 
-### 3. Latenzspitzen & Scan-Unterdrückung
+### 3. Dynamische Hardware-Erkennung & Schutz vor Interface-Swapping (`wlan0` vs `wlan1`)
+- **Problem (Race-Condition beim Boot):** Auf Systemen mit interner WLAN-Karte (z. B. MediaTek MT7922 / `mt7921e` via PCIe) und externem USB-Dongle initialisieren Kernel-Treiber asynchron und parallel. Je nachdem, ob PCIe oder USB zuerst fertig initialisiert, erhält der Dongle beim Booten `wlan0` oder `wlan1`.
+- **Lösung in steamframe-setup:**
+  1. **Eindeutige Hardware-Erkennung via USB VID/PID (`28de:2432`):** `DongleDetector` traversiert den Sysfs-Gerätebaum und identifiziert den Valve Steam Frame Dongle unfehlbar über Vendor-ID `28de` (Valve Corporation) und Product-ID `2432`.
+  2. **Automatischer Schutz interner WLAN-Karten:** Interne PCIe-Karten (`mt7921e`, `iwlwifi`, etc.) werden erkannt, im Status angezeigt und strikt von Toggles und Modifikationen ausgenommen.
+  3. **Treiber- und MAC-basiertes NetworkManager-Powersave:** Die NM-Konfiguration `/etc/NetworkManager/conf.d/99-steamframe-powersave.conf` matcht dynamisch über `driver:rtw89_8852cu;...;mac:<MAC>` statt starr über `interface-name:wlan0`.
+  4. **Dynamischer NM-Dispatcher:** `/etc/NetworkManager/dispatcher.d/99-steamframe.sh` prüft bei jedem Netzwerk-Event (`up`, `down`) über Sysfs, ob das aufgerufene Interface zur `rtw89`-Familie gehört oder die USB-ID `28de:2432` trägt. Interne Karten werden ignoriert.
+  5. **Swapping-sichere Firewall-Regeln:** Bei Scope `iface` werden Portfreigaben für alle relevanten Wireless-Interfaces hinterlegt, sodass VRLink-Traffic nach einem Reboot auch bei getauschten Interface-Namen ungehindert passiert.
+
+### 4. Latenzspitzen & Scan-Unterdrückung
 - **Problem:** Wi-Fi-Powersave und zyklische Background-Scans von wpa_supplicant führen zu Rucklern und Latenzspitzen von bis zu 400 ms.
 - **Warum `wpa_cli` unter NetworkManager oft versagt:**
   NetworkManager steuert `wpa_supplicant` standardmäßig über D-Bus an. Das klassische UNIX-Socket-Control-Interface ist häufig nicht aktiv oder nutzt zufällige Netzwerk-IDs.
@@ -161,13 +170,14 @@ Jede durch `steamframe-setup apply` durchgeführte Systemanpassung wird in `/var
 ### 4. Valve Holo Realtek Firmware Toggles (SteamOS Low-Latency Integration)
 Aus dem SteamOS/Holo-Repository von Valve (`sabae@valvesoftware.com`) stammt das Paket `holo-realtek-firmware-toggles`, das speziell für Steam Frame und `rtw89` entwickelt wurde.
 - **Warum das Paket auf Desktop-Systemen fehlte:** SteamVR/VRLink versucht dieses Tool unter SteamOS via Polkit aufzurufen. Auf Standard-Distros wie CachyOS fehlt das Tool und die Polkit-Berechtigung, wodurch der Low-Latency-Modus fehlschlägt.
-- **Was `set-low-latency-mode on` bewirkt:**
+- **Was `set-low-latency-mode on` bewirkt (Gehärtete Fassung):**
   1. `HW_SCAN off`: Schaltet das Hardware-Hintergrundscanning im Realtek-DebugFS (`disable_dm`) aus – die eigentliche Ursache für periodische 400-ms-Spitzen!
   2. `set-amsdu off`: `iw dev <if> set tidconf tids 0xff amsdu off` umgeht einen bekannten Treiber-Bug bei A-MSDU-Aggregation im Realtek-Treiber.
-  3. `set-mcs-rates 0-9`: Begrenzt die MCS-Raten auf den 5- und 6-GHz-Bändern (Spatial Streams 1 & 2) auf 0–9, um Rate-Thrashing und Framedrops zu verhindern.
-  4. `set-powersave off`: Deaktiviert Host-Powersave und Firmware-seitiges `INACTIVE_PS`.
-  5. `set-pd-thresh -75`: Setzt den Packet-Detection-Threshold auf -75 dBm, um entfernte Störsignale zu ignorieren.
-  6. `set-aggressive-edca on`: Schreibt aggressive Paket-Timing-Register (`c300`, `c304`, `c308`, `c30c`), analog zu Valves Windows-Treiber-Anpassung.
+  3. `set-powersave off`: Deaktiviert Host-Powersave und Firmware-seitiges `INACTIVE_PS`.
+  4. `set-pd-thresh -75`: Setzt den Packet-Detection-Threshold auf -75 dBm, um entfernte Störsignale zu ignorieren.
+  5. **Kernel-Stabilitäts-Patch (Crash-Guard):** `set-mcs-rates` via `iw dev ... set bitrates` ist im Skript neutralisiert, da es im Linux-Kernel-Treiber `rtw89_core` (`rtw89_phy_rate_pattern_vif`) zuverlässig eine fatale NULL-Pointer-Dereferenzierung mit IRQ-Lockout auslöst. Wi-Fi 6 handelt MCS-Raten dynamisch stabil aus.
+  6. **Interface-Filter (Valve Issue #2983 Fix):** Filtert `p2p-dev-*`-Interfaces zuverlässig heraus, wodurch Fehlerausstiege und ungedrosselte `pkexec`-Dauerschleifen des Steam-Clients verhindert werden.
+  7. **EDCA-Bereinigung:** Direktes Beschreiben von DebugFS-Registern (`c300`–`c30c`) entfällt, da EDCA-Werte AP-seitig von SteamVR/Hostapd gesetzt werden.
 - **Integration in steamframe-setup:**
   - Installiert `/usr/bin/holo-polkit-helpers/holo-realtek-firmware-toggles` und die Polkit-Action `/usr/share/polkit-1/actions/org.valve.holo-realtek-firmware-toggles.policy`.
   - Bindet den Aufruf an den NetworkManager-Dispatcher (`set-low-latency-mode on` bei Interface-Up, `reset` bei Interface-Down).

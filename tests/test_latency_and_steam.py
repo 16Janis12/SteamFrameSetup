@@ -36,14 +36,17 @@ class TestLatencyAndSteam(unittest.TestCase):
         nm_conf = self.executor.resolve_path(sf.NM_CONF_REL)
         self.assertTrue(nm_conf.exists())
         nm_text = nm_conf.read_text(encoding="utf-8")
-        self.assertIn("match-device=interface-name:wlan1", nm_text)
+        self.assertIn("driver:rtw89_8852cu", nm_text)
+        self.assertIn("interface-name:wlan1", nm_text)
         self.assertIn("wifi.powersave=2", nm_text)
 
         # Check NM dispatcher script
         dispatcher = self.executor.resolve_path(sf.NM_DISPATCHER_REL)
         self.assertTrue(dispatcher.exists())
         disp_text = dispatcher.read_text(encoding="utf-8")
-        self.assertIn('TARGET_IFACE="wlan1"', disp_text)
+        self.assertIn("is_steamframe_iface", disp_text)
+        self.assertIn("28de", disp_text)
+        self.assertIn("2432", disp_text)
         self.assertIn("iw dev", disp_text)
         self.assertIn("bgscan", disp_text)
 

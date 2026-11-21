@@ -51,6 +51,28 @@ class TestHoloFirmwareManager(unittest.TestCase):
         self.assertIn(str(bin_path), created_files)
         self.assertIn(str(policy_path), created_files)
 
+        # Check safety features in installed script
+        bin_content = bin_path.read_text(encoding="utf-8")
+        self.assertIn("rtw89_phy_rate_pattern_vif", bin_content)
+        self.assertIn("grep -v 'p2p'", bin_content)
+        self.assertNotIn('iw dev "${WLAN_NAME}" set bitrates', bin_content)
+
+    def test_apply_patches_existing_unhardened_binary(self):
+        """If an unhardened binary is on disk, HoloFirmwareManager applies the safety patch."""
+        bin_path = self.executor.resolve_path(sf.HOLO_TOGGLE_BIN_REL)
+        policy_path = self.executor.resolve_path(sf.HOLO_POLKIT_POLICY_REL)
+        bin_path.parent.mkdir(parents=True, exist_ok=True)
+        policy_path.parent.mkdir(parents=True, exist_ok=True)
+        bin_path.write_text("#!/bin/bash\n# unpatched\niw dev wlan0 set bitrates 0-9\n")
+        policy_path.write_text("<policyconfig></policyconfig>")
+
+        self.executor.set_response(("pacman", "-Q", "holo-realtek-firmware-toggles"), returncode=0, stdout="holo-realtek-firmware-toggles 1.4-1")
+
+        actions = self.holo.apply(self.manifest_mgr, self.manifest_data)
+        updated_content = bin_path.read_text(encoding="utf-8")
+        self.assertIn("rtw89_phy_rate_pattern_vif", updated_content)
+        self.assertIn("Kernel-Crash-Guard aktiv", "\n".join(actions))
+
     def test_revert_holo(self):
         """Revert should invoke reset command on helper binary."""
         bin_path = self.executor.resolve_path(sf.HOLO_TOGGLE_BIN_REL)
